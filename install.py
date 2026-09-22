@@ -149,40 +149,63 @@ exec {python3_bin} /usr/share/nulltrace/nulltrace.py "$@"
         sys.exit(1)
 
 
-def has_live_nulltrace_rules() -> bool:
-    """Inspect live iptables/ip6tables rulesets for NULLTRACE chains or jump rules (P2.5)."""
+class FirewallInspectionResult:
+    CLEAN = "CLEAN"
+    ACTIVE = "ACTIVE"
+    UNKNOWN = "UNKNOWN"
+
+
+def inspect_live_nulltrace_rules() -> str:
+    """
+    Tri-state inspection of live iptables/ip6tables rulesets (P1.5):
+    - CLEAN: binaries ran successfully and no NULLTRACE chains or rules exist.
+    - ACTIVE: binaries ran successfully and NULLTRACE chains or rules exist.
+    - UNKNOWN: iptables binary missing or command errored.
+    """
     iptables_bin = resolve_trusted_binary("iptables")
-    if iptables_bin:
-        for table in ("filter", "nat", "mangle"):
-            try:
-                res = run_trusted([iptables_bin, "-t", table, "-S"], check=False)
-                if res.returncode == 0:
-                    for line in res.stdout.splitlines():
-                        if "NULLTRACE" in line:
-                            return True
-            except Exception:
-                pass
+    if not iptables_bin:
+        return FirewallInspectionResult.UNKNOWN
+
+    found_active = False
+    for table in ("filter", "nat", "mangle"):
+        try:
+            res = run_trusted([iptables_bin, "-t", table, "-S"], check=False)
+            if res.returncode != 0:
+                return FirewallInspectionResult.UNKNOWN
+            for line in res.stdout.splitlines():
+                if "NULLTRACE" in line:
+                    found_active = True
+        except Exception:
+            return FirewallInspectionResult.UNKNOWN
 
     ip6tables_bin = resolve_trusted_binary("ip6tables")
     if ip6tables_bin:
         for table in ("filter", "mangle"):
             try:
                 res = run_trusted([ip6tables_bin, "-t", table, "-S"], check=False)
-                if res.returncode == 0:
-                    for line in res.stdout.splitlines():
-                        if "NULLTRACE" in line:
-                            return True
+                if res.returncode != 0:
+                    return FirewallInspectionResult.UNKNOWN
+                for line in res.stdout.splitlines():
+                    if "NULLTRACE" in line:
+                        found_active = True
             except Exception:
-                pass
+                return FirewallInspectionResult.UNKNOWN
 
-    return False
+    if found_active:
+        return FirewallInspectionResult.ACTIVE
+    return FirewallInspectionResult.CLEAN
+
+
+def has_live_nulltrace_rules() -> bool:
+    """Inspect live iptables/ip6tables rulesets for NULLTRACE chains or jump rules (P1.5, P2.5)."""
+    return inspect_live_nulltrace_rules() == FirewallInspectionResult.ACTIVE
 
 
 def routing_may_be_active() -> bool:
     """
-    Check if nulltrace routing is active via live firewall inspection or persisted state (P2.5).
+    Check if nulltrace routing is active via live firewall inspection or persisted state (P1.5, P2.5).
     """
-    # 1. Inspect live firewall rules first (P2.5)
+    # 1. Inspect live firewall rules first (P1.5, P2.5)
     if has_live_nulltrace_rules():
         return True
 
@@ -216,9 +239,16 @@ def uninstall_nulltrace(
     emergency_flush: bool = False,
 ):
     """
-    Safely uninstall nulltrace without destructive table flushes (NT-007, NT-006, P2.5).
+    Safely uninstall nulltrace without destructive table flushes (NT-007, NT-006, P1.5, P2.5).
     Never clears unrelated host firewall rules by default.
+    Aborts immediately if live firewall inspection returns UNKNOWN.
     """
+    fw_status = inspect_live_nulltrace_rules()
+    if fw_status == FirewallInspectionResult.UNKNOWN:
+        print("[!] ERROR: Live firewall state cannot be verified (iptables unavailable or inspection failed).")
+        print("    Uninstallation aborted to prevent leaving orphaned live rules or unrecoverable firewall state.")
+        sys.exit(1)
+
     if routing_may_be_active():
         print("[!] nulltrace routing appears to be active or uncleaned.")
         print("    Attempting to safely restore network rules via nulltrace --force-stop...")
@@ -231,12 +261,17 @@ def uninstall_nulltrace(
         restore_ok = False
         try:
             res = run_trusted([python3_bin, script_path, "--force-stop"], check=False)
-            if res.returncode == 0 and not has_live_nulltrace_rules():
+            post_status = inspect_live_nulltrace_rules()
+            if post_status == FirewallInspectionResult.UNKNOWN:
+                print("[!] ERROR: Post-stop firewall inspection failed (UNKNOWN).")
+                print("    Uninstallation aborted to protect system networking.")
+                sys.exit(1)
+            if res.returncode == 0 and post_status == FirewallInspectionResult.CLEAN:
                 restore_ok = True
                 print("[+] Network rules and Tor configuration restored successfully.")
             else:
                 err_msg = res.stderr.strip() or res.stdout.strip()
-                if has_live_nulltrace_rules():
+                if post_status == FirewallInspectionResult.ACTIVE:
                     err_msg = "Live NULLTRACE firewall rules still detected after stop attempt."
                 print(f"[!] nulltrace --force-stop failed (code {res.returncode}): {err_msg}")
         except Exception as exc:

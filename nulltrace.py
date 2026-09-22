@@ -12,6 +12,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -55,6 +56,23 @@ STATE_RESTORING = "RESTORING"
 STATE_RESTORE_FAILED = "RESTORE_FAILED"
 STATE_RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
 
+RECOVERABLE_STATES: Tuple[str, ...] = (
+    STATE_ACTIVE,
+    STATE_ACTIVATING,
+    STATE_PREPARING,
+    STATE_RESTORING,
+    STATE_RESTORE_FAILED,
+    STATE_RECOVERY_REQUIRED,
+)
+
+# User-Facing Enforcement & Routing Status (P2.7)
+STATUS_ENFORCING_TOR_HEALTHY = "ENFORCING_TOR_HEALTHY"
+STATUS_ENFORCING_TOR_UNHEALTHY = "ENFORCING_TOR_UNHEALTHY"
+STATUS_INACTIVE = "INACTIVE"
+STATUS_RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
+STATUS_RESTORE_FAILED = "RESTORE_FAILED"
+STATUS_UNKNOWN = "UNKNOWN"
+
 
 class TeardownStatus:
     VERIFIED_CLEAN = "VERIFIED_CLEAN"
@@ -82,6 +100,25 @@ CHAIN_V6_INPUT = "NULLTRACE_V6_INPUT"
 CHAIN_V6_FORWARD = "NULLTRACE_V6_FORWARD"
 CHAIN_V6_MANGLE_OUTPUT = "NULLTRACE_V6_MANGLE_OUTPUT"
 CHAIN_V6_MANGLE_PREROUTING = "NULLTRACE_V6_MANGLE_PREROUTING"
+
+ALL_OWNED_CHAINS_V4: Set[str] = {
+    CHAIN_FILTER_OUTPUT,
+    CHAIN_FILTER_INPUT,
+    CHAIN_FILTER_FORWARD,
+    CHAIN_NAT_OUTPUT,
+    CHAIN_MANGLE_OUTPUT,
+    CHAIN_MANGLE_PREROUTING,
+}
+
+ALL_OWNED_CHAINS_V6: Set[str] = {
+    CHAIN_V6_OUTPUT,
+    CHAIN_V6_INPUT,
+    CHAIN_V6_FORWARD,
+    CHAIN_V6_MANGLE_OUTPUT,
+    CHAIN_V6_MANGLE_PREROUTING,
+}
+
+ALL_OWNED_CHAINS: Set[str] = ALL_OWNED_CHAINS_V4 | ALL_OWNED_CHAINS_V6
 
 # Tor Connection Mark for Deterministic Conntrack Isolation (NT-002, P1.3)
 CONNMARK_VALUE = "0x4e540000"
@@ -207,10 +244,23 @@ def atomic_write(
     gid: Optional[int] = None,
 ) -> None:
     """
-    Atomically write content to path using temporary file, fsync, and replace (NT-015, P1.1).
+    Atomically write content to path using temporary file, fsync, and replace (NT-015, P1.1, P2.6).
     Preserves original file permissions and ownership; never widens permissions.
     New files default to restrictive 0o600 permissions.
+    Rejects writing to symlinks or non-regular files (FIFOs, sockets, devices).
     """
+    path_obj = Path(path)
+    if path_obj.exists() or os.path.islink(str(path_obj)):
+        try:
+            lst = os.lstat(str(path_obj))
+            if stat.S_ISLNK(lst.st_mode):
+                raise ValueError(f"Destination '{path}' is a symlink; refusing privileged write.")
+            if not stat.S_ISREG(lst.st_mode):
+                raise ValueError(f"Destination '{path}' is not a regular file; refusing write.")
+        except OSError as exc:
+            if getattr(exc, "errno", None) != errno.ENOENT:
+                raise
+
     dest = Path(path).resolve()
     dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -295,9 +345,13 @@ def atomic_write(
 def get_config_home() -> Path:
     sudo_user = os.environ.get("SUDO_USER")
     if sudo_user and sudo_user != "root":
-        user_home = Path(f"/home/{sudo_user}")
-        if user_home.exists():
-            return user_home / ".config" / "nulltrace"
+        try:
+            import pwd
+            pw = pwd.getpwnam(sudo_user)
+            user_home = Path(pw.pw_dir)
+        except Exception:
+            user_home = Path(f"/home/{sudo_user}")
+        return user_home / ".config" / "nulltrace"
     return Path.home() / ".config" / "nulltrace"
 
 
@@ -359,27 +413,79 @@ def require_linux_root(action: str) -> None:
 
 
 def resolve_config_path(filename: str) -> Path:
-    """Restrict config files to ~/.config/nulltrace/ (relative names only)."""
+    """
+    Restrict config files to canonical ~/.config/nulltrace/ (relative names only).
+    Rejects symlinks in config directory or any path component, ensures target is a regular file (P0.1, P2.6).
+    """
     if not filename or filename != Path(filename).name or "/" in filename or "\\" in filename or ".." in filename:
         raise ValueError(
             "Config filename must be a plain name (e.g. myconfig.json), not a path"
         )
+
     config_home = get_config_home()
-    config_home.mkdir(parents=True, exist_ok=True)
+
+    # Verify security of path components leading to config_home (P0.1)
+    current = Path(config_home.parts[0]) if os.name != "nt" else Path(config_home.drive + "\\")
+    for part in config_home.parts[1:]:
+        current = current / part
+        if current.exists() or os.path.islink(str(current)):
+            try:
+                st = os.lstat(str(current))
+                if stat.S_ISLNK(st.st_mode):
+                    raise ValueError(
+                        f"Config path component '{current}' is a symlink: untrusted redirect rejected"
+                    )
+            except OSError as exc:
+                if getattr(exc, "errno", None) != errno.ENOENT:
+                    raise
+
+    # Establish config directory without trusting pre-existing symlinks
+    if config_home.exists() or os.path.islink(str(config_home)):
+        st = os.lstat(str(config_home))
+        if stat.S_ISLNK(st.st_mode):
+            raise ValueError(
+                f"Config directory '{config_home}' is a symlink: untrusted redirect rejected"
+            )
+        if not stat.S_ISDIR(st.st_mode):
+            raise ValueError(
+                f"Config directory '{config_home}' is not a directory"
+            )
+    else:
+        config_home.mkdir(parents=True, mode=0o700, exist_ok=True)
+
     sudo_user = os.environ.get("SUDO_USER")
     if sudo_user and sudo_user != "root":
         try:
             import pwd
             pw = pwd.getpwnam(sudo_user)
-            os.chown(config_home, pw.pw_uid, pw.pw_gid)
+            # Never chown a symlink (P0.1)
+            st = os.lstat(str(config_home))
+            if not stat.S_ISLNK(st.st_mode) and stat.S_ISDIR(st.st_mode):
+                if hasattr(os, "lchown"):
+                    os.lchown(str(config_home), pw.pw_uid, pw.pw_gid)
+                else:
+                    os.chown(str(config_home), pw.pw_uid, pw.pw_gid)
         except (KeyError, OSError, ImportError, AttributeError):
             pass
-    resolved = (config_home / filename).resolve()
+
+    target = config_home / filename
+    if target.exists() or os.path.islink(str(target)):
+        st = os.lstat(str(target))
+        if stat.S_ISLNK(st.st_mode):
+            raise ValueError(
+                f"Config file '{target}' is a symlink: untrusted redirect rejected"
+            )
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(
+                f"Config file '{target}' must be a regular file, not a FIFO, socket, device, or directory"
+            )
+
+    resolved = target.resolve()
     try:
         resolved.relative_to(config_home.resolve())
     except ValueError:
         raise ValueError("Config path must stay under ~/.config/nulltrace/")
-    return resolved
+    return target
 
 
 @dataclass
@@ -422,8 +528,9 @@ class nulltrace:
 
     def _discover_session_id(self) -> Optional[str]:
         """
-        Discover active or latest uncleaned session ID from persistent state or session directory (P0.1).
-        Deterministically prioritizes active/uncleaned sessions, then timestamp, then session name.
+        Discover active or uncleaned recoverable session ID from persistent state or session directory (P0.1, P1.2).
+        Only sessions in RECOVERABLE_STATES are considered.
+        Historical INACTIVE sessions are never selected for recovery.
         """
         # 1. State files
         for sf in (PERSISTENT_DIR / "state.json", RUN_DIR / "state.json"):
@@ -432,13 +539,13 @@ class nulltrace:
                     data = json.loads(sf.read_text(encoding="utf-8"))
                     sid = data.get("session_id")
                     st = data.get("state")
-                    if sid and (st in (STATE_ACTIVE, STATE_ACTIVATING, STATE_PREPARING, STATE_RESTORING, STATE_RESTORE_FAILED, STATE_RECOVERY_REQUIRED) or data.get("active")):
+                    if sid and (st in RECOVERABLE_STATES or data.get("active")):
                         if (PERSISTENT_DIR / f"session_{sid}").exists() or sf == (PERSISTENT_DIR / "state.json"):
                             return sid
                 except (OSError, json.JSONDecodeError):
                     pass
 
-        # 2. Session directory candidates with deterministic priority
+        # 2. Session directory candidates with deterministic priority (only recoverable states)
         if PERSISTENT_DIR.exists():
             state_priority = {
                 STATE_ACTIVE: 6,
@@ -447,7 +554,6 @@ class nulltrace:
                 STATE_PREPARING: 3,
                 STATE_ACTIVATING: 3,
                 STATE_RESTORING: 2,
-                STATE_INACTIVE: 1,
             }
             parsed_candidates = []
             for c in PERSISTENT_DIR.glob("session_*"):
@@ -468,17 +574,6 @@ class nulltrace:
                 # Sort newest/highest priority first, tie-break by sid
                 parsed_candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3]), reverse=True)
                 return parsed_candidates[0][3]
-
-        # 3. Fallback to state file session_id even if state is inactive
-        for sf in (PERSISTENT_DIR / "state.json", RUN_DIR / "state.json"):
-            if sf.exists():
-                try:
-                    data = json.loads(sf.read_text(encoding="utf-8"))
-                    sid = data.get("session_id")
-                    if sid:
-                        return sid
-                except (OSError, json.JSONDecodeError):
-                    pass
 
         return None
 
@@ -510,11 +605,18 @@ class nulltrace:
 
     @staticmethod
     def is_valid_ip(value: str) -> bool:
-        return bool(value and IPV4_RE.match(value.strip()))
+        """Validate IPv4 address using ipaddress (P2.9)."""
+        if not value or not isinstance(value, str):
+            return False
+        try:
+            ip = ipaddress.ip_address(value.strip())
+            return ip.version == 4
+        except ValueError:
+            return False
 
     @staticmethod
     def is_valid_loopback_ip(value: str) -> bool:
-        """Validate that value is strictly a loopback address (NT-005)."""
+        """Validate that value is strictly a loopback address (NT-005, P2.9)."""
         if not value or not isinstance(value, str):
             return False
         try:
@@ -525,7 +627,17 @@ class nulltrace:
 
     @staticmethod
     def is_valid_cidr(value: str) -> bool:
-        return bool(value and CIDR_RE.match(value.strip()))
+        """Validate IPv4 CIDR network using ipaddress (P2.9)."""
+        if not value or not isinstance(value, str):
+            return False
+        val = value.strip()
+        if "/" not in val:
+            return False
+        try:
+            net = ipaddress.ip_network(val, strict=False)
+            return net.version == 4
+        except ValueError:
+            return False
 
     @staticmethod
     def is_valid_port(value) -> bool:
@@ -556,12 +668,13 @@ class nulltrace:
 
     def validate_tor_config_target(self, path: Union[str, Path]) -> Path:
         """
-        Validate Tor config target path and integrity before privileged operations (NT-014):
+        Validate Tor config target path and integrity before privileged operations (NT-014, P2.5, P2.6):
         - Canonical, symlink-safe resolution inside /etc/tor/
         - Rejects symlink traversal escaping /etc/tor/
+        - Requires target to be a regular file (rejects FIFOs, devices, sockets, symlinks)
         - Verifies target file is not world-writable
-        - Verifies target ownership (root or tor user) when run as root
-        - Verifies target directory is not world-writable
+        - Verifies strict root ownership (UID 0 only; rejects Tor daemon user or unprivileged ownership)
+        - Verifies target directory is not world-writable and root-owned
         """
         if not path or not isinstance(path, (str, Path)):
             raise ValueError("Tor config path cannot be empty")
@@ -580,28 +693,26 @@ class nulltrace:
             if st_parent.st_mode & 0o002:
                 raise ValueError(f"Insecure Tor config directory '{parent}': world-writable")
             if hasattr(os, "geteuid") and os.geteuid() == 0:
-                tor_uid = int(self.tor_user) if (hasattr(self, "_tor_user") and self._tor_user and self._tor_user.isdigit()) else None
-                allowed_uids = {0}
-                if tor_uid is not None:
-                    allowed_uids.add(tor_uid)
-                if st_parent.st_uid not in allowed_uids:
+                # P2.5: Security-sensitive Tor config directory must be root-owned (UID 0 only)
+                if st_parent.st_uid != 0:
                     raise ValueError(
-                        f"Insecure Tor config directory '{parent}': owned by untrusted UID {st_parent.st_uid}"
+                        f"Insecure Tor config directory '{parent}': owned by untrusted UID {st_parent.st_uid} (must be root-owned)"
                     )
 
-        # Check target file safety if it already exists (POSIX permission and ownership checks)
-        if p.exists() and hasattr(os, "getuid"):
-            st = p.stat()
-            if st.st_mode & 0o002:
+        # Check target file safety if it exists (P2.5, P2.6)
+        if p.exists() or os.path.islink(str(p)):
+            lst = os.lstat(str(p))
+            if stat.S_ISLNK(lst.st_mode):
+                raise ValueError(f"Insecure Tor config file '{p}': symlink target rejected")
+            if not stat.S_ISREG(lst.st_mode):
+                raise ValueError(f"Insecure Tor config file '{p}': must be a regular file, not FIFO, socket, device, or directory")
+            if hasattr(os, "getuid") and (lst.st_mode & 0o002):
                 raise ValueError(f"Insecure Tor config file '{p}': world-writable")
             if hasattr(os, "geteuid") and os.geteuid() == 0:
-                tor_uid = int(self.tor_user) if (hasattr(self, "_tor_user") and self._tor_user and self._tor_user.isdigit()) else None
-                allowed_uids = {0}
-                if tor_uid is not None:
-                    allowed_uids.add(tor_uid)
-                if st.st_uid not in allowed_uids:
+                # P2.5: Security-sensitive Tor config file must be root-owned (UID 0 only)
+                if lst.st_uid != 0:
                     raise ValueError(
-                        f"Insecure Tor config file '{p}': owned by untrusted UID {st.st_uid}"
+                        f"Insecure Tor config file '{p}': owned by untrusted UID {lst.st_uid} (must be root-owned)"
                     )
         return p
 
@@ -635,16 +746,37 @@ class nulltrace:
             )
         if not self.is_valid_cidr(self.config.tor_network):
             raise ValueError(f"Invalid Tor network CIDR: {self.config.tor_network}")
+        # Normalize tor_network CIDR
+        self.config.tor_network = str(ipaddress.ip_network(self.config.tor_network.strip(), strict=False))
+
         # NT-014: Symlink-safe Tor config path
         if not self.is_valid_tor_config_path(self.config.tor_config):
             raise ValueError(f"Invalid Tor config path: {self.config.tor_config}")
+
         if self.config.exit_country:
-            if len(self.config.exit_country) != 2 or not self.config.exit_country.isalpha():
+            # P2.10: ASCII-only two-letter country code normalized to uppercase
+            if not re.match(r"^[A-Za-z]{2}$", self.config.exit_country):
                 raise ValueError(f"Invalid exit country code: {self.config.exit_country}")
+            self.config.exit_country = self.config.exit_country.upper()
+
         self._limit_excluded_lists()
-        for network in self.config.excluded_networks + self.config.excluded_ips:
+        # P2.9: Normalize excluded network CIDRs and IPs with ipaddress
+        normalized_networks = []
+        for network in self.config.excluded_networks:
             if not self.is_valid_cidr(network):
                 raise ValueError(f"Invalid excluded network CIDR: {network}")
+            normalized_networks.append(str(ipaddress.ip_network(network.strip(), strict=False)))
+        self.config.excluded_networks = normalized_networks
+
+        normalized_ips = []
+        for ip_val in self.config.excluded_ips:
+            if self.is_valid_ip(ip_val):
+                normalized_ips.append(str(ipaddress.ip_address(ip_val.strip())))
+            elif self.is_valid_cidr(ip_val):
+                normalized_ips.append(str(ipaddress.ip_network(ip_val.strip(), strict=False)))
+            else:
+                raise ValueError(f"Invalid excluded IP address or CIDR: {ip_val}")
+        self.config.excluded_ips = normalized_ips
 
     def validate_circuit_time(self, value: int) -> None:
         if not 60 <= value <= 86400:
@@ -684,11 +816,11 @@ class nulltrace:
         return config_block
 
     def _ensure_runtime_dirs(self) -> None:
-        RUN_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
-        PERSISTENT_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
+        RUN_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        PERSISTENT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
-            os.chmod(RUN_DIR, 0o755)
-            os.chmod(PERSISTENT_DIR, 0o755)
+            os.chmod(RUN_DIR, 0o700)
+            os.chmod(PERSISTENT_DIR, 0o700)
         except OSError:
             pass
 
@@ -756,11 +888,78 @@ class nulltrace:
 
         return None
 
-    def _persist_session_metadata(self) -> None:
-        """Persist session metadata and recovery record with fatal write errors (NT-010, NT-015, P0.3, P2.4)."""
-        if hasattr(os, "geteuid") and os.geteuid() != 0:
-            return
+    def _generate_enforcement_manifest(self) -> Dict[str, Any]:
+        """
+        Generate enforcement manifest for current session (P0.2).
+        Records expected chains, jumps, and rule fingerprints for live integrity verification.
+        """
+        iptables_bin = resolve_trusted_binary("iptables")
+        ip6tables_bin = resolve_trusted_binary("ip6tables")
 
+        manifest: Dict[str, Any] = {
+            "version": "1.0",
+            "tool_version": "2.0.0",
+            "session_id": self.session_id,
+            "created_at": datetime.now().isoformat(),
+            "expected_jumps_v4": [
+                {"table": "filter", "chain": "OUTPUT", "target": CHAIN_FILTER_OUTPUT},
+                {"table": "filter", "chain": "INPUT", "target": CHAIN_FILTER_INPUT},
+                {"table": "filter", "chain": "FORWARD", "target": CHAIN_FILTER_FORWARD},
+                {"table": "nat", "chain": "OUTPUT", "target": CHAIN_NAT_OUTPUT},
+                {"table": "mangle", "chain": "OUTPUT", "target": CHAIN_MANGLE_OUTPUT},
+                {"table": "mangle", "chain": "PREROUTING", "target": CHAIN_MANGLE_PREROUTING},
+            ],
+            "expected_jumps_v6": [
+                {"table": "filter", "chain": "OUTPUT", "target": CHAIN_V6_OUTPUT},
+                {"table": "filter", "chain": "INPUT", "target": CHAIN_V6_INPUT},
+                {"table": "filter", "chain": "FORWARD", "target": CHAIN_V6_FORWARD},
+                {"table": "mangle", "chain": "OUTPUT", "target": CHAIN_V6_MANGLE_OUTPUT},
+                {"table": "mangle", "chain": "PREROUTING", "target": CHAIN_V6_MANGLE_PREROUTING},
+            ],
+            "chain_fingerprints": {},
+        }
+
+        # Compute fingerprints for all v4 chains
+        if iptables_bin:
+            table_chains_v4 = [
+                ("nat", CHAIN_NAT_OUTPUT),
+                ("mangle", CHAIN_MANGLE_OUTPUT),
+                ("mangle", CHAIN_MANGLE_PREROUTING),
+                ("filter", CHAIN_FILTER_OUTPUT),
+                ("filter", CHAIN_FILTER_INPUT),
+                ("filter", CHAIN_FILTER_FORWARD),
+            ]
+            for table, chain in table_chains_v4:
+                try:
+                    res = run_trusted([iptables_bin, "-t", table, "-S", chain], check=False)
+                    if res.returncode == 0:
+                        canon = "\n".join(sorted(l.strip() for l in res.stdout.splitlines() if l.strip()))
+                        manifest["chain_fingerprints"][f"v4:{table}:{chain}"] = hashlib.sha256(canon.encode()).hexdigest()
+                except Exception:
+                    pass
+
+        # Compute fingerprints for all v6 chains
+        if ip6tables_bin:
+            table_chains_v6 = [
+                ("mangle", CHAIN_V6_MANGLE_OUTPUT),
+                ("mangle", CHAIN_V6_MANGLE_PREROUTING),
+                ("filter", CHAIN_V6_OUTPUT),
+                ("filter", CHAIN_V6_INPUT),
+                ("filter", CHAIN_V6_FORWARD),
+            ]
+            for table, chain in table_chains_v6:
+                try:
+                    res = run_trusted([ip6tables_bin, "-t", table, "-S", chain], check=False)
+                    if res.returncode == 0:
+                        canon = "\n".join(sorted(l.strip() for l in res.stdout.splitlines() if l.strip()))
+                        manifest["chain_fingerprints"][f"v6:{table}:{chain}"] = hashlib.sha256(canon.encode()).hexdigest()
+                except Exception:
+                    pass
+
+        return manifest
+
+    def _persist_session_metadata(self, manifest: Optional[Dict[str, Any]] = None) -> None:
+        """Persist session metadata and recovery record with fatal write errors (NT-010, NT-015, P0.3, P2.1, P2.2)."""
         sdir = self._session_dir()
         sdir.mkdir(parents=True, exist_ok=True)
         try:
@@ -768,11 +967,19 @@ class nulltrace:
         except OSError:
             pass
 
+        if manifest is not None:
+            self._enforcement_manifest = manifest
+        manifest = getattr(self, "_enforcement_manifest", None)
+        if manifest:
+            manifest_file = sdir / "manifest.json"
+            atomic_write(manifest_file, json.dumps(manifest, indent=2), mode=0o600)
+
         meta = {
             "session_id": self.session_id,
             "created_at": getattr(self, "_session_created_at", datetime.now().isoformat()),
             "tool_version": "2.0.0",
             "state": self._current_state,
+            "consumed": (self._current_state == STATE_INACTIVE),
             "spoofed_intf": self._spoofed_intf,
             "original_mac": self._original_mac,
             "mac_restored": getattr(self, "_mac_restored", False),
@@ -785,22 +992,18 @@ class nulltrace:
             "iptables_v4_hash": getattr(self, "_iptables_v4_hash", None),
             "iptables_v6_backup": str(sdir / "iptables.v6.bak"),
             "iptables_v6_hash": getattr(self, "_iptables_v6_hash", None),
-            "custom_chains": [
-                CHAIN_FILTER_OUTPUT, CHAIN_FILTER_INPUT, CHAIN_FILTER_FORWARD,
-                CHAIN_NAT_OUTPUT, CHAIN_MANGLE_OUTPUT, CHAIN_MANGLE_PREROUTING,
-                CHAIN_V6_OUTPUT, CHAIN_V6_INPUT, CHAIN_V6_FORWARD,
-                CHAIN_V6_MANGLE_OUTPUT, CHAIN_V6_MANGLE_PREROUTING,
-            ],
+            "custom_chains": list(ALL_OWNED_CHAINS),
+            "enforcement_manifest": manifest,
             "failures": getattr(self, "_restore_failures", []),
         }
 
         meta_file = sdir / "metadata.json"
-        # Mandatory write: failure must not be silently swallowed (P0.3)
+        # Mandatory write: failure must not be silently swallowed (P0.3, P2.1)
         atomic_write(meta_file, json.dumps(meta, indent=2), mode=0o600)
         self._write_state(self._current_state)
 
     def _write_state(self, state: str) -> None:
-        """Durable atomic write for runtime state files with fatal persistent error (NT-015, P0.3)."""
+        """Durable atomic write for runtime state files with fatal persistent error (NT-015, P0.3, P2.1, P2.2)."""
         self._ensure_runtime_dirs()
         self._current_state = state
 
@@ -817,20 +1020,36 @@ class nulltrace:
         content = json.dumps(payload, indent=2)
 
         # Persistent state write is mandatory for crash/reboot recovery.
-        # Failures must raise and be fatal (P0.3).
-        atomic_write(PERSISTENT_DIR / "state.json", content, mode=0o644)
+        # Failures must raise and be fatal (P0.3, P2.1, P2.2).
+        atomic_write(PERSISTENT_DIR / "state.json", content, mode=0o600)
         try:
-            atomic_write(RUN_DIR / "state.json", content, mode=0o644)
+            atomic_write(RUN_DIR / "state.json", content, mode=0o600)
         except OSError:
             pass
 
     def _set_state(self, new_state: str) -> None:
+        old_state = getattr(self, "_current_state", STATE_INACTIVE)
         self._current_state = new_state
-        self._persist_session_metadata()
+        try:
+            self._persist_session_metadata()
+        except Exception:
+            self._current_state = old_state
+            raise
 
     def _check_live_firewall_status(self) -> str:
         """
-        Inspect live kernel firewall state for NULLTRACE rules (P0.2, P0.5).
+        Inspect live kernel firewall state for NULLTRACE rules (P0.2, P0.3, P0.5).
+        Validates:
+        1. All expected top-level jumps exist exactly once in base chains.
+        2. All owned custom chains exist.
+        3. All owned chains contain the exact nulltrace ownership marker comment.
+        4. No owned chain is empty.
+        5. Critical policy enforcement rules exist in owned chains:
+           - NULLTRACE_NAT_OUTPUT must redirect TCP to tor_port and UDP 53 to dns_port.
+           - NULLTRACE_OUTPUT must end in DROP and have no early unconditioned RETURN or ACCEPT.
+           - NULLTRACE_FORWARD must end in DROP.
+           - IPv6 chains must exist and enforce DROP/REJECT for non-Tor traffic.
+        6. If session enforcement manifest is available, compares canonical rules/hashes against manifest.
         Returns LiveFirewallStatus: ACTIVE, CLEAN, PARTIAL, or UNKNOWN.
         """
         iptables_bin = resolve_trusted_binary("iptables")
@@ -838,74 +1057,181 @@ class nulltrace:
             return LiveFirewallStatus.UNKNOWN
 
         required_v4_jumps = [
-            ("filter", f"-A OUTPUT -j {CHAIN_FILTER_OUTPUT}"),
-            ("filter", f"-A INPUT -j {CHAIN_FILTER_INPUT}"),
-            ("filter", f"-A FORWARD -j {CHAIN_FILTER_FORWARD}"),
-            ("nat", f"-A OUTPUT -j {CHAIN_NAT_OUTPUT}"),
-            ("mangle", f"-A OUTPUT -j {CHAIN_MANGLE_OUTPUT}"),
-            ("mangle", f"-A PREROUTING -j {CHAIN_MANGLE_PREROUTING}"),
+            ("filter", "OUTPUT", CHAIN_FILTER_OUTPUT),
+            ("filter", "INPUT", CHAIN_FILTER_INPUT),
+            ("filter", "FORWARD", CHAIN_FILTER_FORWARD),
+            ("nat", "OUTPUT", CHAIN_NAT_OUTPUT),
+            ("mangle", "OUTPUT", CHAIN_MANGLE_OUTPUT),
+            ("mangle", "PREROUTING", CHAIN_MANGLE_PREROUTING),
         ]
-        all_owned_v4 = (
-            CHAIN_FILTER_OUTPUT, CHAIN_FILTER_INPUT, CHAIN_FILTER_FORWARD,
-            CHAIN_NAT_OUTPUT, CHAIN_MANGLE_OUTPUT, CHAIN_MANGLE_PREROUTING,
-        )
+        required_v6_jumps = [
+            ("filter", "OUTPUT", CHAIN_V6_OUTPUT),
+            ("filter", "INPUT", CHAIN_V6_INPUT),
+            ("filter", "FORWARD", CHAIN_V6_FORWARD),
+            ("mangle", "OUTPUT", CHAIN_V6_MANGLE_OUTPUT),
+            ("mangle", "PREROUTING", CHAIN_V6_MANGLE_PREROUTING),
+        ]
 
-        found_jumps = 0
-        total_rules = 0
+        total_nulltrace_lines = 0
 
+        # Check v4 tables
+        table_rules_v4: Dict[str, List[str]] = {}
         for table in ("filter", "nat", "mangle"):
             try:
                 res = run_trusted([iptables_bin, "-t", table, "-S"], check=False)
                 if isinstance(res.returncode, int) and res.returncode != 0:
                     return LiveFirewallStatus.UNKNOWN
-                lines = [l.strip() for l in (res.stdout or "").splitlines()]
-                for line in lines:
-                    if any(c in line for c in all_owned_v4):
-                        total_rules += 1
-                for req_table, req_jump in required_v4_jumps:
-                    if req_table == table and any(req_jump in l for l in lines):
-                        found_jumps += 1
+                lines = [l.strip() for l in (res.stdout or "").splitlines() if l.strip()]
+                table_rules_v4[table] = lines
+                for l in lines:
+                    if "NULLTRACE" in l:
+                        total_nulltrace_lines += 1
             except OSError:
                 return LiveFirewallStatus.UNKNOWN
 
-        expected_jumps = len(required_v4_jumps)
-
-        if self._check_ipv6_enabled():
-            ip6tables_bin = resolve_trusted_binary("ip6tables")
-            if not ip6tables_bin:
-                return LiveFirewallStatus.UNKNOWN
-            required_v6_jumps = [
-                ("filter", f"-A OUTPUT -j {CHAIN_V6_OUTPUT}"),
-                ("filter", f"-A INPUT -j {CHAIN_V6_INPUT}"),
-                ("filter", f"-A FORWARD -j {CHAIN_V6_FORWARD}"),
-                ("mangle", f"-A OUTPUT -j {CHAIN_V6_MANGLE_OUTPUT}"),
-                ("mangle", f"-A PREROUTING -j {CHAIN_V6_MANGLE_PREROUTING}"),
-            ]
-            all_owned_v6 = (
-                CHAIN_V6_OUTPUT, CHAIN_V6_INPUT, CHAIN_V6_FORWARD,
-                CHAIN_V6_MANGLE_OUTPUT, CHAIN_V6_MANGLE_PREROUTING,
-            )
-            expected_jumps += len(required_v6_jumps)
+        # Check v6 tables (always checked if ip6tables is available)
+        ip6tables_bin = resolve_trusted_binary("ip6tables")
+        table_rules_v6: Dict[str, List[str]] = {}
+        if ip6tables_bin:
             for table in ("filter", "mangle"):
                 try:
                     res = run_trusted([ip6tables_bin, "-t", table, "-S"], check=False)
                     if isinstance(res.returncode, int) and res.returncode != 0:
                         return LiveFirewallStatus.UNKNOWN
-                    lines = [l.strip() for l in (res.stdout or "").splitlines()]
-                    for line in lines:
-                        if any(c in line for c in all_owned_v6):
-                            total_rules += 1
-                    for req_table, req_jump in required_v6_jumps:
-                        if req_table == table and any(req_jump in l for l in lines):
-                            found_jumps += 1
+                    lines = [l.strip() for l in (res.stdout or "").splitlines() if l.strip()]
+                    table_rules_v6[table] = lines
+                    for l in lines:
+                        if "NULLTRACE" in l:
+                            total_nulltrace_lines += 1
                 except OSError:
                     return LiveFirewallStatus.UNKNOWN
+        else:
+            return LiveFirewallStatus.UNKNOWN
 
-        if total_rules == 0:
+        if total_nulltrace_lines == 0:
             return LiveFirewallStatus.CLEAN
-        if found_jumps == expected_jumps:
-            return LiveFirewallStatus.ACTIVE
-        return LiveFirewallStatus.PARTIAL
+
+        # 1. Verify expected v4 jumps exist exactly once
+        for table, base_chain, target_chain in required_v4_jumps:
+            lines = table_rules_v4.get(table, [])
+            expected_jump = f"-A {base_chain} -j {target_chain}"
+            matching = [l for l in lines if l == expected_jump or (l.startswith(f"-A {base_chain} ") and f"-j {target_chain}" in l)]
+            if len(matching) != 1:
+                return LiveFirewallStatus.PARTIAL
+
+        # 2. Verify expected v6 jumps exist exactly once
+        for table, base_chain, target_chain in required_v6_jumps:
+            lines = table_rules_v6.get(table, [])
+            expected_jump = f"-A {base_chain} -j {target_chain}"
+            matching = [l for l in lines if l == expected_jump or (l.startswith(f"-A {base_chain} ") and f"-j {target_chain}" in l)]
+            if len(matching) != 1:
+                return LiveFirewallStatus.PARTIAL
+
+        # 3. Verify each owned v4 chain exists and inspect its contents (P0.2)
+        v4_chains = [
+            ("nat", CHAIN_NAT_OUTPUT),
+            ("mangle", CHAIN_MANGLE_OUTPUT),
+            ("mangle", CHAIN_MANGLE_PREROUTING),
+            ("filter", CHAIN_FILTER_OUTPUT),
+            ("filter", CHAIN_FILTER_INPUT),
+            ("filter", CHAIN_FILTER_FORWARD),
+        ]
+        for table, chain in v4_chains:
+            try:
+                res = run_trusted([iptables_bin, "-t", table, "-S", chain], check=False)
+                if res.returncode != 0:
+                    return LiveFirewallStatus.PARTIAL
+                chain_lines = [l.strip() for l in (res.stdout or "").splitlines() if l.strip()]
+                rule_lines = [l for l in chain_lines if l.startswith("-A ")]
+                if not rule_lines:
+                    return LiveFirewallStatus.PARTIAL
+                if not any(CHAIN_MARKER_COMMENT in l for l in chain_lines):
+                    return LiveFirewallStatus.PARTIAL
+
+                if chain == CHAIN_FILTER_OUTPUT:
+                    # Must contain catch-all DROP
+                    if not any(l == f"-A {CHAIN_FILTER_OUTPUT} -j DROP" or l.endswith("-j DROP") for l in rule_lines):
+                        return LiveFirewallStatus.PARTIAL
+                    # Check for early unconditioned return or accept (policy bypass)
+                    for l in rule_lines:
+                        tokens = l.split()
+                        if "-j" in tokens:
+                            idx = tokens.index("-j")
+                            if idx + 1 < len(tokens) and tokens[idx + 1] in ("RETURN", "ACCEPT"):
+                                if len(tokens) <= 4:
+                                    return LiveFirewallStatus.PARTIAL
+
+                if chain == CHAIN_NAT_OUTPUT:
+                    if not any(f"--to-ports {self.config.tor_port}" in l for l in rule_lines):
+                        return LiveFirewallStatus.PARTIAL
+                    if not any(f"--to-ports {self.config.dns_port}" in l for l in rule_lines):
+                        return LiveFirewallStatus.PARTIAL
+
+                if chain == CHAIN_FILTER_FORWARD:
+                    if not any(l.endswith("-j DROP") for l in rule_lines):
+                        return LiveFirewallStatus.PARTIAL
+
+            except OSError:
+                return LiveFirewallStatus.UNKNOWN
+
+        # 4. Verify each owned v6 chain exists and inspect contents (P0.2, P0.3)
+        v6_chains = [
+            ("mangle", CHAIN_V6_MANGLE_OUTPUT),
+            ("mangle", CHAIN_V6_MANGLE_PREROUTING),
+            ("filter", CHAIN_V6_OUTPUT),
+            ("filter", CHAIN_V6_INPUT),
+            ("filter", CHAIN_V6_FORWARD),
+        ]
+        for table, chain in v6_chains:
+            try:
+                res = run_trusted([ip6tables_bin, "-t", table, "-S", chain], check=False)
+                if res.returncode != 0:
+                    return LiveFirewallStatus.PARTIAL
+                chain_lines = [l.strip() for l in (res.stdout or "").splitlines() if l.strip()]
+                rule_lines = [l for l in chain_lines if l.startswith("-A ")]
+                if not rule_lines:
+                    return LiveFirewallStatus.PARTIAL
+                if not any(CHAIN_MARKER_COMMENT in l for l in chain_lines):
+                    return LiveFirewallStatus.PARTIAL
+                if chain == CHAIN_V6_OUTPUT:
+                    if not any("-j REJECT" in l or "-j DROP" in l for l in rule_lines):
+                        return LiveFirewallStatus.PARTIAL
+                if chain == CHAIN_V6_FORWARD:
+                    if not any(l.endswith("-j DROP") for l in rule_lines):
+                        return LiveFirewallStatus.PARTIAL
+            except OSError:
+                return LiveFirewallStatus.UNKNOWN
+
+        # 5. Check manifest fingerprints if manifest exists
+        meta = self._load_session_metadata()
+        manifest = None
+        if meta and "enforcement_manifest" in meta:
+            manifest = meta["enforcement_manifest"]
+        elif self._session_id:
+            m_path = self._session_dir() / "manifest.json"
+            if m_path.exists():
+                try:
+                    manifest = json.loads(m_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+
+        if manifest and "chain_fingerprints" in manifest:
+            fps = manifest["chain_fingerprints"]
+            for key, expected_hash in fps.items():
+                family, table, chain = key.split(":")
+                bin_cmd = iptables_bin if family == "v4" else ip6tables_bin
+                try:
+                    res = run_trusted([bin_cmd, "-t", table, "-S", chain], check=False)
+                    if res.returncode != 0:
+                        return LiveFirewallStatus.PARTIAL
+                    canon = "\n".join(sorted(l.strip() for l in res.stdout.splitlines() if l.strip()))
+                    live_hash = hashlib.sha256(canon.encode()).hexdigest()
+                    if live_hash != expected_hash:
+                        return LiveFirewallStatus.PARTIAL
+                except Exception:
+                    return LiveFirewallStatus.UNKNOWN
+
+        return LiveFirewallStatus.ACTIVE
 
     def reconcile_state(self) -> str:
         """
@@ -966,6 +1292,24 @@ class nulltrace:
 
     def is_active(self) -> bool:
         return self._get_current_state() == STATE_ACTIVE
+
+    def get_enforcement_status(self) -> str:
+        """
+        Distinguish live firewall enforcement from Tor routing health (P2.7).
+        Invariant: ENFORCING_TOR_UNHEALTHY means traffic remains safely blocked (fail-closed), never direct.
+        """
+        current_state = self._get_current_state()
+        if current_state == STATE_ACTIVE:
+            tor_running = self.check_tor_service()
+            tor_ports_ok = self.check_tor_ports() if tor_running else False
+            if tor_running and tor_ports_ok:
+                return STATUS_ENFORCING_TOR_HEALTHY
+            return STATUS_ENFORCING_TOR_UNHEALTHY
+        if current_state == STATE_INACTIVE:
+            return STATUS_INACTIVE
+        if current_state in (STATE_RECOVERY_REQUIRED, STATE_RESTORE_FAILED, STATE_ACTIVATING, STATE_PREPARING, STATE_RESTORING):
+            return STATUS_RECOVERY_REQUIRED
+        return STATUS_UNKNOWN
 
     def save_config(self, filename: str = "nulltrace_config.json") -> bool:
         try:
@@ -1169,10 +1513,106 @@ class nulltrace:
         ok, _ = self._control_tor_service("is-active")
         return ok
 
+    def _verify_process_is_tor(self, pid: int) -> bool:
+        """
+        Verify that pid is genuine Tor daemon by checking UID and executable path (P1.1, P2.4).
+        """
+        if pid <= 0:
+            return False
+        proc_pid = Path(f"/proc/{pid}")
+        if not proc_pid.is_dir():
+            return False
+
+        # 1. UID check from /proc/<pid>/status
+        status_file = proc_pid / "status"
+        if not status_file.exists():
+            return False
+        try:
+            status_text = status_file.read_text(encoding="utf-8")
+        except OSError:
+            return False
+
+        uid_match = re.search(r"^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)", status_text, re.MULTILINE)
+        if not uid_match:
+            return False
+        real_uid, eff_uid = int(uid_match.group(1)), int(uid_match.group(2))
+
+        expected_uid = None
+        if hasattr(self, "_tor_user") and self._tor_user:
+            if self._tor_user.isdigit():
+                expected_uid = int(self._tor_user)
+            else:
+                try:
+                    import pwd
+                    expected_uid = pwd.getpwnam(self._tor_user).pw_uid
+                except Exception:
+                    pass
+
+        if expected_uid is not None:
+            if eff_uid != expected_uid and real_uid != expected_uid:
+                return False
+
+        # 2. Executable target check from /proc/<pid>/exe
+        exe_file = proc_pid / "exe"
+        try:
+            target_exe = os.readlink(str(exe_file))
+        except OSError:
+            return False
+
+        tor_bin = resolve_trusted_binary("tor")
+        target_path = Path(target_exe)
+        target_posix = target_path.as_posix()
+
+        is_trusted_tor = False
+        if tor_bin and target_posix == Path(tor_bin).as_posix():
+            is_trusted_tor = True
+        else:
+            for tdir in TRUSTED_BIN_DIRS:
+                if target_posix in (f"{tdir}/tor", f"{tdir}/tor.real"):
+                    is_trusted_tor = True
+                    break
+
+        if not is_trusted_tor:
+            return False
+
+        # 3. Liveness check to avoid PID recycle
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+
+        return True
+
+    def _find_pid_by_socket_inode(self, inode: str) -> Optional[int]:
+        """Search /proc/<pid>/fd/ to map socket inode to owning PID (P2.4)."""
+        proc_root = Path("/proc")
+        try:
+            if not proc_root.is_dir():
+                return None
+            for p_dir in proc_root.iterdir():
+                if not p_dir.is_dir() or not p_dir.name.isdigit():
+                    continue
+                candidate_pid = int(p_dir.name)
+                fd_dir = p_dir / "fd"
+                try:
+                    if not fd_dir.is_dir():
+                        continue
+                    for fd in fd_dir.iterdir():
+                        try:
+                            if os.readlink(str(fd)) == f"socket:[{inode}]":
+                                return candidate_pid
+                        except OSError:
+                            continue
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        return None
+
     def _verify_listener_ownership(self, port: int, proto: str) -> bool:
         """
-        Verify that the configured listener port is owned by the intended Tor process/user (P1.5).
-        Rejects rogue listeners and non-Tor processes.
+        Verify that configured listener port is strictly owned by intended Tor daemon process (P1.1, P2.4).
+        Rejects rogue listeners, spoofed comm names, wrong UIDs, or untrusted executables.
         """
         inspected = False
 
@@ -1184,52 +1624,80 @@ class nulltrace:
                 res = run_trusted([ss_bin, "-H", flag, f"sport = :{port}"], check=False)
                 if res.returncode == 0:
                     inspected = True
-                    out = res.stdout.strip()
-                    if out:
-                        if "users:((" in out:
-                            if re.search(r'users:\(\("tor(?:\.real)?"', out):
+                    lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
+                    found_any_socket = False
+                    for line in lines:
+                        parts = line.split()
+                        local_addr = ""
+                        if len(parts) >= 4:
+                            local_addr = parts[3] if parts[0] in ("LISTEN", "UNCONN") else parts[2] if len(parts) > 2 else ""
+                        elif len(parts) >= 2:
+                            for p in parts:
+                                if ":" in p and not p.startswith("users:"):
+                                    local_addr = p
+                                    break
+                        if local_addr:
+                            host, _, p_str = local_addr.rpartition(":")
+                            host = host.strip("[]")
+                            if p_str and p_str != str(port):
+                                continue
+                            found_any_socket = True
+                            if host not in ("127.0.0.1", self.config.localhost):
+                                return False
+
+                        pid_match = re.search(r"pid=(\d+)", line)
+                        if pid_match:
+                            found_any_socket = True
+                            pid = int(pid_match.group(1))
+                            if self._verify_process_is_tor(pid):
                                 return True
-                            # Another process is listening on this port!
+                            if not Path("/proc").is_dir() and re.search(r'users:\(\("tor(?:\.real)?"', line):
+                                return True
                             return False
-                    else:
-                        # ss executed and found no socket listening on this port
+                    if found_any_socket:
                         return False
             except OSError:
                 pass
 
-        # 2. Check /proc/net/{tcp,udp} for UID matching tor_user
+        # 2. Check /proc/net/{tcp,udp} and search /proc/<pid>/fd/ for socket inode (P2.4)
         proc_file = Path(f"/proc/net/{proto.lower()}")
         if proc_file.exists():
             try:
-                tor_uid_int = int(self.tor_user)
-                port_found = False
+                tor_uid_int = int(self.tor_user) if (self.tor_user and self.tor_user.isdigit()) else None
+                hex_port = f"{port:04X}"
+                matching_inodes = []
                 for line in proc_file.read_text(encoding="utf-8").splitlines()[1:]:
                     parts = line.strip().split()
-                    if len(parts) >= 8:
+                    if len(parts) >= 10:
                         local_addr = parts[1]
                         if ":" in local_addr:
-                            hex_port = local_addr.split(":")[1]
-                            try:
-                                if int(hex_port, 16) == port:
-                                    port_found = True
-                                    socket_uid = int(parts[7])
-                                    if socket_uid == tor_uid_int:
-                                        return True
-                            except ValueError:
-                                continue
+                            ip_hex, p_hex = local_addr.split(":")
+                            if p_hex.upper() == hex_port:
+                                st = parts[3]
+                                if proto.lower() == "tcp" and st != "0A":
+                                    continue
+                                if ip_hex.upper() != "0100007F":
+                                    continue
+                                sock_uid = int(parts[7])
+                                if tor_uid_int is not None and sock_uid != tor_uid_int:
+                                    continue
+                                inode = parts[9]
+                                matching_inodes.append(inode)
+
                 inspected = True
-                if port_found:
-                    # Sockets were found on this port, but none owned by Tor daemon UID
+                if not matching_inodes:
                     return False
-                else:
-                    # No sockets found on this port at all
-                    return False
+
+                for inode in matching_inodes:
+                    candidate_pid = self._find_pid_by_socket_inode(inode)
+                    if candidate_pid is not None:
+                        if self._verify_process_is_tor(candidate_pid):
+                            return True
+                    elif not Path("/proc").is_dir():
+                        return True
+                return False
             except (OSError, ValueError):
                 pass
-
-        # 3. Fallback: only if neither ss nor /proc was available on the host
-        if not inspected:
-            return self.check_tor_service()
 
         return False
 
@@ -1265,7 +1733,7 @@ class nulltrace:
 
     def check_tor_ports(self) -> bool:
         """
-        Verify both TransPort (TCP) and DNSPort (UDP protocol-level probe) are functional and owned by Tor (NT-008, P1.5).
+        Verify both TransPort (TCP) and DNSPort (UDP protocol-level probe) are functional and owned by Tor (NT-008, P1.1, P1.5).
         """
         if not self.check_tor_service():
             return False
@@ -1273,7 +1741,7 @@ class nulltrace:
         tor_port_int = int(self.config.tor_port)
         dns_port_int = int(self.config.dns_port)
 
-        # Verify listener ownership (P1.5)
+        # Verify listener ownership (P1.1, P1.5)
         if not self._verify_listener_ownership(tor_port_int, "tcp"):
             return False
         if not self._verify_listener_ownership(dns_port_int, "udp"):
@@ -1314,19 +1782,11 @@ class nulltrace:
         self._control_tor_service("restart")
 
     def _check_ipv6_enabled(self) -> bool:
-        """Check if IPv6 is enabled on the host (NT-001)."""
-        try:
-            test_sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-            test_sock.close()
-        except OSError:
-            return False
-
-        disable_ipv6_path = Path("/proc/sys/net/ipv6/conf/all/disable_ipv6")
-        if disable_ipv6_path.exists():
-            try:
-                return disable_ipv6_path.read_text(encoding="utf-8").strip() == "0"
-            except OSError:
-                pass
+        """
+        Check if IPv6 is available/enforceable on host via ip6tables (NT-001, P0.3).
+        IPv6 application traffic is always blocked while a Nulltrace session is active.
+        Never condition enforcement on initial sysfs/interface state.
+        """
         return True
 
     def _ip6tables_available(self) -> bool:
@@ -1355,11 +1815,18 @@ class nulltrace:
             self._iptables_v6_hash = hashlib.sha256(res_v6.stdout.encode()).hexdigest()
 
     def backup_tor_config(self) -> None:
-        """Session-bound backup of Tor configuration (NT-010, NT-014, NT-015)."""
+        """Session-bound backup of Tor configuration (NT-010, NT-014, NT-015, P1.8)."""
         path = self.validate_tor_config_target(self.config.tor_config)
         sdir = self._session_dir()
         sdir.mkdir(parents=True, exist_ok=True)
         backup_path = sdir / "torrc.bak"
+
+        # P1.8: Baseline snapshot must be taken exactly once per session.
+        if backup_path.exists():
+            if not getattr(self, "_tor_config_hash", None):
+                content = backup_path.read_text(encoding="utf-8")
+                self._tor_config_hash = hashlib.sha256(content.encode()).hexdigest()
+            return
 
         if path.exists():
             clean_content = strip_tor_config_blocks(path.read_text(encoding="utf-8"))
@@ -1384,18 +1851,27 @@ class nulltrace:
         self._restart_tor()
 
     def restore_tor_config(self) -> None:
-        """Restore Tor configuration from session backup and verify service restart (NT-010, NT-014, NT-015, P1.1, P2.4)."""
+        """
+        Restore Tor configuration preserving administrator changes (NT-010, NT-014, NT-015, P1.3, P2.4).
+        Strips only the nulltrace-managed block from the live torrc file.
+        """
         sdir = self._session_dir()
         backup_path = sdir / "torrc.bak"
         path = self.validate_tor_config_target(self.config.tor_config)
 
-        if backup_path.exists():
+        if path.exists():
+            current_content = path.read_text(encoding="utf-8")
+            if torrc_has_managed_block(current_content):
+                cleaned = strip_tor_config_blocks(current_content)
+                atomic_write(path, cleaned)
+            elif backup_path.exists():
+                baseline_content = backup_path.read_text(encoding="utf-8")
+                if current_content == baseline_content:
+                    atomic_write(path, baseline_content)
+            self._tor_file_restored = True
+        elif backup_path.exists():
             content = strip_tor_config_blocks(backup_path.read_text(encoding="utf-8"))
             atomic_write(path, content)
-            self._tor_file_restored = True
-        elif path.exists():
-            cleaned = strip_tor_config_blocks(path.read_text(encoding="utf-8"))
-            atomic_write(path, cleaned)
             self._tor_file_restored = True
 
         ok, detail = self._control_tor_service("restart")
@@ -1605,7 +2081,13 @@ class nulltrace:
         """
         Verify chain ownership before reusing or flushing (P1.7).
         Rejects unauthenticated pre-existing chains to avoid flushing unrelated rules.
+        Requires both chain name in ALL_OWNED_CHAINS and exact CHAIN_MARKER_COMMENT.
         """
+        if chain not in ALL_OWNED_CHAINS and not chain.startswith("NULLTRACE_"):
+            raise RuntimeError(
+                f"Firewall chain '{chain}' is not a recognized Nulltrace owned chain name. Refusing to operate."
+            )
+
         res = run_trusted([iptables_bin, "-t", table, "-S", chain], check=False)
         if res.returncode != 0:
             # Chain does not exist yet; create it and tag with nulltrace comment (without early return)
@@ -1616,19 +2098,13 @@ class nulltrace:
             ], check=True)
             return
 
-        # Chain already exists. Authenticate ownership.
+        # Chain already exists. Authenticate ownership strictly by marker comment (P1.7)
         lines = res.stdout
-        is_owned = (
-            CHAIN_MARKER_COMMENT in lines
-            or CONNMARK_VALUE in lines
-            or "0x4e54" in lines
-            or f"--to-ports {self.config.dns_port}" in lines
-            or f"--to-ports {self.config.tor_port}" in lines
-        )
+        is_owned = CHAIN_MARKER_COMMENT in lines
         if not is_owned:
             raise RuntimeError(
                 f"Firewall chain '{chain}' in table '{table}' already exists and is not authenticated "
-                "as nulltrace-owned. Refusing to mutate or flush unrecognized chain."
+                "as nulltrace-owned (missing ownership marker comment). Refusing to mutate or flush unrecognized chain."
             )
 
         # Authenticated: safe to flush and re-tag
@@ -1732,7 +2208,7 @@ class nulltrace:
             "-m", "owner", "--uid-owner", self.tor_user, "-j", "ACCEPT",
         ], check=True)
         for net in self._excluded_destinations():
-            run_trusted([iptables_bin, "-A", CHAIN_FILTER_OUTPUT, "-d", net, "-j", "ACCEPT"], check=True)
+            run_trusted([iptables_bin, "-A", CHAIN_FILTER_OUTPUT, "-d", net, "-j", "RETURN"], check=True)
 
         # Allow DHCP requests outbound
         run_trusted([
@@ -1869,7 +2345,8 @@ class nulltrace:
             ip6tables_bin = resolve_trusted_binary("ip6tables")
             if not ip6tables_bin:
                 raise RuntimeError(
-                    "IPv6 is enabled on host but ip6tables is missing. Aborting to prevent IPv6 leak."
+                    "IPv6 fail-closed enforcement required: ip6tables is missing. "
+                    "Aborting startup to prevent IPv6 bypass/leaks."
                 )
             run_trusted([ip6tables_bin, "-I", "OUTPUT", "1", "-j", CHAIN_V6_OUTPUT], check=True)
             run_trusted([ip6tables_bin, "-I", "INPUT", "1", "-j", CHAIN_V6_INPUT], check=True)
@@ -2082,8 +2559,19 @@ class nulltrace:
             self._setup_custom_chains_v4()
             self._setup_custom_chains_v6()
 
+            # P0.2, P1.6: Generate and persist manifest BEFORE jump activation
+            self._enforcement_manifest = self._generate_enforcement_manifest()
+            self._persist_session_metadata()
+
             print("[*] Activating privacy routing...")
             self._activate_jump_rules()
+
+            # P0.2, P1.6: Verify live firewall state matches expected manifest before transitioning to ACTIVE
+            live_status = self._check_live_firewall_status()
+            if live_status != LiveFirewallStatus.ACTIVE:
+                raise RuntimeError(
+                    f"Firewall live state verification failed ({live_status}). Ruleset does not match intended privacy manifest."
+                )
 
             # Mark state ACTIVE only after complete verification
             self._set_state(STATE_ACTIVE)
@@ -2095,9 +2583,9 @@ class nulltrace:
         finally:
             self._release_lock()
 
-    def stop_privacy_mode(self, force: bool = False) -> None:
+    def stop_privacy_mode(self, force: bool = False, destructive: bool = False) -> None:
         """
-        Teardown state machine: ACTIVE -> RESTORING -> INACTIVE or RESTORE_FAILED (NT-004, P0.1, P0.4, P2.1).
+        Teardown state machine: ACTIVE -> RESTORING -> INACTIVE or RESTORE_FAILED (NT-004, P0.1, P0.4, P1.2, P1.4, P2.1).
         Never clears state if any restoration step fails; preserves recovery artifacts.
         """
         require_linux_root("restore network routing")
@@ -2131,6 +2619,13 @@ class nulltrace:
 
             current_state = self._get_current_state()
 
+            # P1.2: If force is requested but no recoverable session exists and system is already clean
+            if force and meta is None and current_state == STATE_INACTIVE:
+                live_fw = self._check_live_firewall_status()
+                if live_fw in (LiveFirewallStatus.CLEAN, "INACTIVE", "CLEAN"):
+                    print("[+] System is already clean (state is INACTIVE, no unrecovered sessions found). Nothing requires recovery.")
+                    return
+
             if (
                 current_state not in (
                     STATE_ACTIVE, STATE_ACTIVATING, STATE_PREPARING,
@@ -2157,23 +2652,31 @@ class nulltrace:
                 print(f"[!] {msg}")
                 failures.append(msg)
 
-            # 2. Deactivate and destroy firewall custom chains (NT-003, NT-004, P0.4)
+            # 2. Deactivate and destroy firewall custom chains (NT-003, NT-004, P0.4, P1.4)
             try:
                 self._deactivate_jump_rules()
                 self._destroy_custom_chains()
                 teardown_status = self._verify_firewall_teardown(return_status=True)
                 if teardown_status != TeardownStatus.VERIFIED_CLEAN:
                     print(f"[!] Firewall custom chain teardown incomplete ({teardown_status})")
-                    # Attempt restore from session backup if custom teardown was incomplete
-                    print("[!] Attempting iptables restore from session backup...")
-                    try:
-                        self.restore_iptables_from_backup()
-                        teardown_status2 = self._verify_firewall_teardown(return_status=True)
-                        if teardown_status2 != TeardownStatus.VERIFIED_CLEAN:
-                            failures.append(f"Firewall state unverified after backup restore ({teardown_status2})")
-                    except Exception as restore_exc:
-                        print(f"[!] Firewall backup restoration failed: {restore_exc}")
-                        failures.append(f"Firewall teardown incomplete ({teardown_status}) and backup restore failed: {restore_exc}")
+                    if destructive:
+                        print("[!] WARNING: Destructive recovery requested. Overwriting live firewall with session snapshot...")
+                        try:
+                            self.restore_iptables_from_backup()
+                            teardown_status2 = self._verify_firewall_teardown(return_status=True)
+                            if teardown_status2 != TeardownStatus.VERIFIED_CLEAN:
+                                failures.append(f"Firewall state unverified after backup restore ({teardown_status2})")
+                        except Exception as restore_exc:
+                            print(f"[!] Firewall backup restoration failed: {restore_exc}")
+                            failures.append(f"Firewall teardown incomplete ({teardown_status}) and backup restore failed: {restore_exc}")
+                    else:
+                        msg = (
+                            f"Firewall custom chain teardown incomplete ({teardown_status}). "
+                            "Whole-table snapshot restoration skipped to preserve host firewall rules. "
+                            "Run with --destructive-restore if whole-table overwrite is required."
+                        )
+                        print(f"[!] {msg}")
+                        failures.append(msg)
             except Exception as exc:
                 msg = f"Firewall custom chain teardown failed: {exc}"
                 print(f"[!] {msg}")
@@ -2240,7 +2743,7 @@ class nulltrace:
         return issues
 
     def run_dns_leak_test(self) -> None:
-        print("[*] Checking local DNS configuration for potential leaks...")
+        print("[*] Checking local DNS configuration and Tor DNSPort enforcement health...")
         config_issues = self._check_resolv_conf_leaks()
         current_state = self._get_current_state()
 
@@ -2253,11 +2756,25 @@ class nulltrace:
         else:
             print("[+] resolv.conf looks OK (no external nameservers found)")
 
-        # Verify DNSPort responsiveness
-        if self._probe_dns_port():
+        dns_port_int = int(self.config.dns_port)
+        # P2.3: Verify Tor process ownership of DNSPort
+        listener_owned = self._verify_listener_ownership(dns_port_int, "udp")
+        if not listener_owned:
+            print(f"[!] Tor process does NOT own DNSPort {dns_port_int} (unverified or rogue listener)")
+        else:
+            print(f"[+] Tor process ownership of DNSPort {dns_port_int} verified.")
+
+        # Verify DNSPort responsiveness via protocol probe
+        dns_probe_ok = self._probe_dns_port()
+        if dns_probe_ok:
             print("[+] Tor DNSPort is responding correctly to DNS queries.")
         else:
             print("[!] Tor DNSPort is not responding to DNS queries.")
+
+        if listener_owned and dns_probe_ok:
+            print("[+] Local Tor DNSPort health check: PASSED (ownership + protocol probe verified)")
+        else:
+            print("[!] Local Tor DNSPort health check: FAILED")
 
         if current_state != STATE_ACTIVE:
             print("[!] Privacy routing is currently INACTIVE (run: sudo nulltrace --start)")
@@ -2310,14 +2827,22 @@ class nulltrace:
             print("[!] Note: Run with 'sudo' for complete privileged state verification.")
 
         current_state = self._get_current_state()
+        enforcement_status = self.get_enforcement_status()
         tor_running = self.check_tor_service()
         tor_ports_ok = self.check_tor_ports() if tor_running else False
 
         print("\n[*] nulltrace Status")
         print(f"    Session State: {current_state}")
+        print(f"    Enforcement Status: {enforcement_status}")
         print(f"    Tor Service: {'running' if tor_running else 'stopped'}")
         print(f"    Tor Ports (TransPort/DNSPort): {'healthy' if tor_ports_ok else 'unhealthy/unreachable'}")
         print(f"    Privacy Routing: {'active' if current_state == STATE_ACTIVE else 'inactive'}")
+
+        if enforcement_status == STATUS_ENFORCING_TOR_UNHEALTHY:
+            print("\n[!] WARNING: System is ENFORCING_TOR_UNHEALTHY!")
+            print("    Firewall rules are actively enforcing fail-closed protection (outbound traffic blocked),")
+            print("    but Tor service or listeners are unhealthy. Internet access is blocked to prevent leaks.")
+            print("    REMEDY: Restart Tor (sudo systemctl restart tor) or stop nulltrace (sudo nulltrace --stop).")
 
         if current_state in (STATE_ACTIVATING, STATE_PREPARING, STATE_RESTORING):
             print(f"\n[!] WARNING: System is in intermediate session state: {current_state}!")
@@ -2423,6 +2948,11 @@ def build_parser() -> ArgumentParser:
         "--recover",
         action="store_true",
         help="Recover system state from persistent metadata and session backups",
+    )
+    parser.add_argument(
+        "--destructive-restore",
+        action="store_true",
+        help="Allow destructive whole-table firewall restore on teardown failure",
     )
     parser.add_argument("-n", "--new-ip", action="store_true", help="Request new Tor identity")
     parser.add_argument("-i", "--ip", action="store_true", help="Show current public IP")
@@ -2542,7 +3072,7 @@ def main() -> None:
         if action == "start":
             app.setup_network_rules()
         elif action == "stop":
-            app.stop_privacy_mode(force=args.force_stop or args.recover)
+            app.stop_privacy_mode(force=args.force_stop or args.recover, destructive=args.destructive_restore)
         elif action == "ip":
             app.show_current_ip()
         elif action == "new_ip":

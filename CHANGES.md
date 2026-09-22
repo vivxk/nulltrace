@@ -239,3 +239,113 @@ This section details the critical security, lifecycle correctness, and host inte
   - Validated `IsTor` strictly as a Python `bool`.
   - Validated reported IP addresses using `ipaddress.ip_address()`, correctly supporting both IPv4 and IPv6 exit nodes.
 
+---
+
+## Final Security & Correctness Remediation (Tickets P0.1 through P2.10)
+
+This section details the final security overhaul addressing every ticket in `nulltrace_remaining_issues_agent_handoff.md`.
+
+### P0.1: User-Controlled Config Directory Symlink & Privileged Write Elimination
+- **Remediation**:
+  - Derived canonical target user home from `pwd.getpwnam(sudo_user).pw_dir`.
+  - Inspected every path component leading to `~/.config/nulltrace/` using `os.lstat()` and rejected symlinks before writing or changing permissions.
+  - Required target configuration paths to be regular files (`stat.S_ISREG`), rejecting symlinks, FIFOs, sockets, and devices.
+  - Restricted operations to the canonical directory with `Path.relative_to()`.
+  - Used `os.lchown()` where supported to prevent following symlinks during ownership updates.
+
+### P0.2: Firewall Live-State Verification with Rule Manifests & Fingerprints
+- **Remediation**:
+  - Generated session enforcement manifests (`manifest.json`) recording expected chains, top-level jumps, and SHA256 fingerprints of canonicalized chain rules.
+  - Enhanced `_check_live_firewall_status()` to inspect actual chain rule contents, requiring expected catch-all DROPs, REDIRECTs, and REJECTs.
+  - Rejected early unconditioned `RETURN`/`ACCEPT` rules (policy bypasses).
+  - Compared live chain rule fingerprints against persisted session manifest hashes.
+
+### P0.3: Unconditional IPv6 Application Traffic Lockdown
+- **Remediation**:
+  - Always installs IPv6 enforcement chains whenever `ip6tables` is available, never conditioning enforcement on initial host interface or sysfs state.
+  - Reconciled IPv6 state as part of the live firewall health check.
+  - Aborts startup fail-closed if `ip6tables` is missing, preventing dual-stack cleartext leaks.
+
+### P1.1: Tor Listener Ownership Hardening Against Process Spoofing
+- **Remediation**:
+  - Rejected process comm name matching alone.
+  - Verified listener identity via socket listening state, exact bind address (`127.0.0.1`), owning PID, UID (`/proc/<pid>/status`), and resolved executable path (`/proc/<pid>/exe`) matching trusted Tor binaries.
+
+### P1.2: Stale Inactive Historical Session Recovery Prevention
+- **Remediation**:
+  - Updated `_discover_session_id()` to query only sessions in `RECOVERABLE_STATES` (`ACTIVE`, `PREPARING`, `ACTIVATING`, `RESTORING`, `RESTORE_FAILED`, `RECOVERY_REQUIRED`).
+  - Historical `INACTIVE` sessions are never selected as recovery candidates.
+  - `--force-stop` reports clean when only inactive historical sessions exist.
+
+### P1.3: Tor Configuration Restoration Preserves Administrator Additions
+- **Remediation**:
+  - Implemented `strip_tor_config_blocks()`, removing only the delimited Nulltrace-managed block upon teardown.
+  - Preserves any independent settings or lines added to `/etc/tor/torrc` by the administrator while Nulltrace was active.
+
+### P1.4: Non-Destructive Teardown Preserves Host Firewall State
+- **Remediation**:
+  - Normal teardown removes only Nulltrace-owned jumps and custom chains, preserving host firewall rules (UFW, firewalld, Docker, admin rules).
+  - Whole-table backup snapshot restoration is isolated to the explicit `--destructive-restore` flag.
+
+### P1.5: Uninstaller Tri-State Firewall Inspection & Unknown State Abort
+- **Remediation**:
+  - Implemented `inspect_live_nulltrace_rules()` returning `CLEAN`, `ACTIVE`, or `UNKNOWN`.
+  - Uninstaller immediately aborts with code 1 upon `UNKNOWN` to avoid removing recovery tooling while rules are unverified.
+
+### P1.6: Transactional Firewall Activation & Fail-Closed Rollback
+- **Remediation**:
+  - Constructed and verified complete custom chains before activating position-1 jumps.
+  - State machine commits durable metadata prior to jump activation.
+  - Interruption or command failure triggers transactional fail-closed rollback.
+
+### P1.7: Strict Chain Ownership Authentication
+- **Remediation**:
+  - Required exact `nulltrace-owned` comment marker on existing chains before reuse or flushing.
+  - Generic port numbers or marks are not accepted as ownership proof.
+
+### P1.8: Single Baseline Tor Configuration Snapshot Per Session
+- **Remediation**:
+  - Baseline snapshot is taken exactly once per session and never overwritten during re-application.
+
+### P2.1: Consistent Fatal Durability on Metadata & State Writes
+- **Remediation**:
+  - Persistence write failures during activation or state transitions raise immediately, preventing inconsistent or unrecorded states.
+
+### P2.2: Restrictive 0600 Mode for Persistent State
+- **Remediation**:
+  - Ensured persistent and runtime state files (`state.json`, `metadata.json`, `manifest.json`) are created with `0600` permissions.
+
+### P2.3: DNS Leak Verification Verifies Tor Process Ownership
+- **Remediation**:
+  - DNS leak test requires verified Tor process ownership of the DNSPort listener in addition to protocol packet probe success.
+
+### P2.4: Hardened `/proc` Listener Fallback
+- **Remediation**:
+  - `/proc` fallback validates address, port, PID, UID, and executable binary path before accepting listener.
+
+### P2.5: Strict Root-Only Ownership for Tor Configuration Files & Directories
+- **Remediation**:
+  - Enforced that `/etc/tor/` and `torrc` must be owned by UID 0 (root-owned) when running as root, rejecting daemon-owned or unprivileged ownership.
+
+### P2.6: Regular File Verification for All Configuration Paths
+- **Remediation**:
+  - Required `stat.S_ISREG` for all file-backed configuration, explicitly rejecting FIFOs, sockets, and character/block devices.
+
+### P2.7: Distinct Enforcement & Routing Status Reporting
+- **Remediation**:
+  - Exposes `ENFORCING_TOR_HEALTHY`, `ENFORCING_TOR_UNHEALTHY`, `INACTIVE`, `RECOVERY_REQUIRED`, `RESTORE_FAILED`, and `UNKNOWN`.
+  - Invariant guaranteed: `ENFORCING_TOR_UNHEALTHY` keeps traffic safely blocked (fail-closed), never falling back to direct Internet.
+
+### P2.8: Documented Position-1 Jump Priority in Firewall Coexistence
+- **Remediation**:
+  - Documented position-1 jump priorities and interaction with UFW, firewalld, Docker, and native nftables.
+
+### P2.9: Canonical IP/CIDR Validation via `ipaddress`
+- **Remediation**:
+  - Replaced handwritten regex IP/CIDR validation with `ipaddress.ip_address()` and `ipaddress.ip_network()`, normalizing addresses and subnets.
+
+### P2.10: ASCII-Only Exit Country Code Validation
+- **Remediation**:
+  - Enforced regex `^[A-Za-z]{2}$` and normalized to uppercase, rejecting non-ASCII unicode lookalikes.
+
+

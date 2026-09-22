@@ -39,6 +39,33 @@ def require_trusted_binary(name: str) -> str:
     return resolved
 
 
+SAFE_ENV_NAMES = {"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "SYSTEMD_COLORS"}
+
+
+def sanitize_environment(env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Construct minimal hardened explicit environment for privileged execution (NT-006, P1.6)."""
+    clean_env = {
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+    source = os.environ if env is None else env
+    for k, v in source.items():
+        if k in SAFE_ENV_NAMES and k not in clean_env:
+            clean_env[k] = v
+        elif env is not None:
+            upper = k.upper()
+            if not (
+                upper.startswith("LD_")
+                or upper.startswith("PYTHON")
+                or "PROXY" in upper
+                or upper in ("TMPDIR", "IFS")
+            ):
+                clean_env[k] = v
+    clean_env["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin"
+    return clean_env
+
+
 def run_trusted(
     cmd: Sequence[str],
     check: bool = True,
@@ -46,7 +73,7 @@ def run_trusted(
     text: bool = True,
     env: Optional[Dict[str, str]] = None,
 ) -> subprocess.CompletedProcess:
-    """Execute command using trusted path resolution and sanitized PATH (NT-006)."""
+    """Execute command using trusted path resolution and minimal hardened environment (NT-006, P1.6)."""
     if not cmd:
         raise ValueError("Command cannot be empty")
     bin_name = cmd[0]
@@ -58,8 +85,7 @@ def run_trusted(
         print(f"[!] Untrusted or missing binary '{bin_name}'")
         sys.exit(1)
 
-    clean_env = dict(env if env is not None else os.environ)
-    clean_env["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin"
+    clean_env = sanitize_environment(env)
 
     return subprocess.run(
         actual_cmd,
@@ -123,7 +149,44 @@ exec {python3_bin} /usr/share/nulltrace/nulltrace.py "$@"
         sys.exit(1)
 
 
+def has_live_nulltrace_rules() -> bool:
+    """Inspect live iptables/ip6tables rulesets for NULLTRACE chains or jump rules (P2.5)."""
+    iptables_bin = resolve_trusted_binary("iptables")
+    if iptables_bin:
+        for table in ("filter", "nat", "mangle"):
+            try:
+                res = run_trusted([iptables_bin, "-t", table, "-S"], check=False)
+                if res.returncode == 0:
+                    for line in res.stdout.splitlines():
+                        if "NULLTRACE" in line:
+                            return True
+            except Exception:
+                pass
+
+    ip6tables_bin = resolve_trusted_binary("ip6tables")
+    if ip6tables_bin:
+        for table in ("filter", "mangle"):
+            try:
+                res = run_trusted([ip6tables_bin, "-t", table, "-S"], check=False)
+                if res.returncode == 0:
+                    for line in res.stdout.splitlines():
+                        if "NULLTRACE" in line:
+                            return True
+            except Exception:
+                pass
+
+    return False
+
+
 def routing_may_be_active() -> bool:
+    """
+    Check if nulltrace routing is active via live firewall inspection or persisted state (P2.5).
+    """
+    # 1. Inspect live firewall rules first (P2.5)
+    if has_live_nulltrace_rules():
+        return True
+
+    # 2. Inspect state files
     candidates = [
         Path("/var/lib/nulltrace/state.json"),
         Path("/run/nulltrace/state.json"),
@@ -137,7 +200,10 @@ def routing_may_be_active() -> bool:
             try:
                 import json
                 data = json.loads(p.read_text(encoding="utf-8"))
-                if data.get("state") in ("ACTIVE", "ACTIVATING", "RESTORING", "RESTORE_FAILED") or data.get("active"):
+                if data.get("state") in (
+                    "ACTIVE", "ACTIVATING", "PREPARING", "RESTORING",
+                    "RESTORE_FAILED", "RECOVERY_REQUIRED"
+                ) or data.get("active"):
                     return True
             except Exception:
                 return True
@@ -150,7 +216,7 @@ def uninstall_nulltrace(
     emergency_flush: bool = False,
 ):
     """
-    Safely uninstall nulltrace without destructive table flushes (NT-007, NT-006).
+    Safely uninstall nulltrace without destructive table flushes (NT-007, NT-006, P2.5).
     Never clears unrelated host firewall rules by default.
     """
     if routing_may_be_active():
@@ -165,11 +231,13 @@ def uninstall_nulltrace(
         restore_ok = False
         try:
             res = run_trusted([python3_bin, script_path, "--force-stop"], check=False)
-            if res.returncode == 0:
+            if res.returncode == 0 and not has_live_nulltrace_rules():
                 restore_ok = True
                 print("[+] Network rules and Tor configuration restored successfully.")
             else:
                 err_msg = res.stderr.strip() or res.stdout.strip()
+                if has_live_nulltrace_rules():
+                    err_msg = "Live NULLTRACE firewall rules still detected after stop attempt."
                 print(f"[!] nulltrace --force-stop failed (code {res.returncode}): {err_msg}")
         except Exception as exc:
             print(f"[!] Failed to execute stop procedure: {exc}")

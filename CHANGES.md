@@ -118,3 +118,124 @@ This document details the comprehensive security remediation executed to guarant
   - Accurately documented DNS policy (UDP/53 redirected, TCP/53 rejected).
   - Clarified IPv6 fail-closed policy.
   - Added comprehensive recovery instructions for interrupted sessions.
+
+---
+
+## Post-Review Security & Correctness Hardening (Tickets P0.1 through P2.7)
+
+This section details the critical security, lifecycle correctness, and host integration fixes implemented on 22 September 2026.
+
+### P0.1: Bind Recovery and Stop to Persisted Active Session
+- **Issue**: A fresh stop/recovery process generated a new session ID before accessing the recovery directory, causing backup lookups under a non-existent session directory.
+- **Remediation**:
+  - Bound stop and recovery operations directly to the persisted session ID.
+  - Ensured all state transitions, directory lookups, and backup restores operate strictly on the target session directory.
+  - Preserved session backups until live teardown verification is completely clean.
+
+### P0.2: Never Trust Persisted ACTIVE Without Live Firewall Verification
+- **Issue**: Disk state survived host reboots while runtime iptables rules did not, allowing stale ACTIVE state files to falsely report protection on an unprotected host.
+- **Remediation**:
+  - Implemented `_check_live_firewall_status()` and `reconcile_state()`.
+  - Persisted ACTIVE state without verified NULLTRACE kernel rules is reconciled to `RECOVERY_REQUIRED`.
+  - Status queries and state checks never fail open or report active without verified kernel enforcement.
+
+### P0.3: Mandatory Recovery-State Persistence Failures Are Fatal
+- **Issue**: Critical state persistence writes caught and ignored `OSError`, allowing activation or teardown to proceed without durable on-disk recovery records.
+- **Remediation**:
+  - Removed silent error-swallowing in `_persist_session_metadata()` and `_write_state()`.
+  - Persistence failures raise fatal exceptions immediately to ensure unrecoverable intermediate states are never created.
+
+### P0.4: Tri-State Teardown Verification
+- **Issue**: Firewall teardown verification did not distinguish between inspection errors and verified absence of rules.
+- **Remediation**:
+  - Implemented tri-state verification returning `TeardownStatus.VERIFIED_CLEAN`, `TeardownStatus.VERIFIED_DIRTY`, or `TeardownStatus.VERIFICATION_FAILED`.
+  - Only `VERIFIED_CLEAN` allows transitioning to `INACTIVE`. Any remaining rules or command failures preserve recovery metadata and set `RESTORE_FAILED`.
+
+### P0.5: Crash/Reboot-Safe Lifecycle State Machine
+- **Issue**: Lifecycle states lacked explicit modeling for interrupted preparation, crashed processes, and post-reboot mismatch.
+- **Remediation**:
+  - Added explicit lifecycle states `PREPARING`, `ACTIVE`, `RESTORING`, `RESTORE_FAILED`, `RECOVERY_REQUIRED`, and `INACTIVE`.
+  - Integrated state reconciliation on all lifecycle boundaries.
+
+### P1.1: Tor Configuration Permissions Preservation
+- **Issue**: Replacing `/etc/tor/torrc` used hardcoded 0644 mode, potentially widening permissions on restrictive configurations (e.g. 0600 or 0640).
+- **Remediation**:
+  - Updated `atomic_write()` to inspect and preserve existing file mode (`stat().st_mode & 0o777`) and file ownership (UID/GID).
+  - Used restrictive defaults (0600 for backups and state) for new files.
+
+### P1.2: Reject IPv6 Listener `::1`
+- **Issue**: Localhost validator accepted `::1` even though transparent interception is currently IPv4-based while application IPv6 is blocked.
+- **Remediation**:
+  - Enforced that Tor listener address must be strictly `127.0.0.1`.
+  - Explicitly rejected `::1`, wildcard, and LAN addresses with descriptive error messages explaining transparent routing constraints.
+
+### P1.3: Bit-Masked CONNMARK Namespace
+- **Issue**: Unmasked whole-mark save/restore clobbered packet marks used by host VPNs, QoS, and policy routing.
+- **Remediation**:
+  - Reserved 16-bit mark namespace: `CONNMARK_MASK = "0xffff0000"`, `CONNMARK_VALUE = "0x4e540000"`, `CONNMARK_TOR = "0x4e540000/0xffff0000"`.
+  - Updated iptables rules to use `--save-mark --mask 0xffff0000` and `--restore-mark --mask 0xffff0000`.
+
+### P1.4: Eliminate Inbound Allow for Outbound Destination Exclusions
+- **Issue**: Excluding an outbound destination subnet automatically created an inbound ACCEPT rule from that subnet in `INPUT`, punching holes in the host firewall.
+- **Remediation**:
+  - Removed the inbound ACCEPT loop for `excluded_networks` from `CHAIN_FILTER_INPUT`.
+  - Outbound destination bypasses remain strictly in `OUTPUT` and `NAT` chains.
+
+### P1.5: Verify Tor Process Listener Ownership
+- **Issue**: DNSPort and TransPort health probes checked port connectivity but did not verify whether Tor or a rogue local process was listening.
+- **Remediation**:
+  - Added `_verify_listener_ownership()` inspecting process names via `ss` (`users:(("tor"...))`) and socket UIDs in `/proc/net/{tcp,udp}` matching the resolved Tor daemon UID.
+
+### P1.6: Privileged Subprocess Environment Hardening
+- **Issue**: Subprocesses inherited ambient environment variables, creating risks from `LD_PRELOAD`, `PYTHONPATH`, or proxy variables.
+- **Remediation**:
+  - Implemented `sanitize_environment()` in both `nulltrace.py` and `install.py`.
+  - Sanitized execution environment to minimal explicit variables (`PATH`, `LANG`, `LC_ALL`), stripping `LD_*`, `PYTHON*`, `*PROXY*`, and `TMPDIR`.
+  - Routed all privileged execution strictly through `run_trusted()`.
+
+### P1.7: Custom Chain Authentication & Ownership
+- **Issue**: Static chain names could allow collision with or accidental flushing of pre-existing administrator chains.
+- **Remediation**:
+  - Implemented `_authenticate_or_create_chain()` tagging owned chains with `CHAIN_MARKER_COMMENT` (`nulltrace-owned`).
+  - Replaced blind chain creation with ownership verification, refusing to flush or mutate unauthenticated existing chains.
+
+### P1.8: No Routine Global Conntrack Flush
+- **Issue**: Calling `conntrack -F` during normal startup wiped out all unrelated host connection tracking entries.
+- **Remediation**:
+  - Removed global `conntrack -F` from `_activate_jump_rules()`.
+  - Relied on strict packet filter default-drop policies and masked CONNMARK isolation.
+
+### P2.1: Interrupted Restoration Signal Safety
+- **Issue**: Abrupt termination via `SIGINT`/`SIGTERM` during `--stop` left persisted state at `RESTORING`.
+- **Remediation**:
+  - Registered signal handlers in `stop_privacy_mode()` to catch termination and persist `RESTORE_FAILED`.
+
+### P2.2: Tor NEWNYM Signal Requirement
+- **Issue**: `--new-ip` fell back to `pkill -HUP tor`, which reloads configuration but does not guarantee a new Tor circuit or identity.
+- **Remediation**:
+  - Removed `pkill -HUP` fallback entirely.
+  - Required verified Tor ControlPort `SIGNAL NEWNYM` success or raised an explicit `RuntimeError`.
+
+### P2.3: Tor ControlPort Effective Directive Discovery
+- **Issue**: Tor config parser selected the first `ControlPort` line, ignoring overrides, comments, or address:port syntax.
+- **Remediation**:
+  - Implemented complete file scanning ignoring commented lines (`#`), parsing address:port notation, and selecting the last active valid directive.
+
+### P2.4: Tor Service Restart Verification During Restoration
+- **Issue**: Restoring Tor configuration on disk did not verify that the Tor daemon successfully restarted.
+- **Remediation**:
+  - Updated `restore_tor_config()` to inspect service restart exit codes and raise `RuntimeError` if the restart fails.
+
+### P2.5: Uninstaller Live Firewall Detection
+- **Issue**: `install.py --uninstall` only checked persisted state files, allowing recovery tooling to be removed while live iptables rules remained stranded.
+- **Remediation**:
+  - Added `has_live_nulltrace_rules()` inspecting live `iptables -S` / `ip6tables -S` rulesets.
+  - Refused uninstallation if live NULLTRACE rules or jumps remain active.
+
+### P2.6 & P2.7: Explicit Proxy Bypass & Strict Type Validation for IP Checks
+- **Issue**: Ambient proxy environment variables (`HTTP_PROXY`, etc.) could hijack `--ip` queries, and truthy non-boolean values or IPv6 exit addresses were mishandled.
+- **Remediation**:
+  - Configured `urllib.request.ProxyHandler({})` in `show_current_ip()` to explicitly bypass ambient proxies.
+  - Validated `IsTor` strictly as a Python `bool`.
+  - Validated reported IP addresses using `ipaddress.ip_address()`, correctly supporting both IPv4 and IPv6 exit nodes.
+

@@ -14,30 +14,34 @@ nulltrace routes system traffic through the Tor network on Linux using iptables 
 ## 🚀 Key Security Architecture
 
 ### ✅ Transactional & Non-Destructive Firewall Architecture
-- **Owned Custom Chains**: All nulltrace firewall rules reside inside owned chains (`NULLTRACE_OUTPUT`, `NULLTRACE_INPUT`, `NULLTRACE_FORWARD`, `NULLTRACE_NAT_OUTPUT`, `NULLTRACE_MANGLE_*`, and `NULLTRACE_V6_*`).
-- **Atomic Activation**: Nulltrace never flushes host firewall tables (`iptables -F`). Unrelated policies from UFW, Docker, or administrator configurations remain untouched. Rules are activated via atomic jump insertions at chain priority 1.
+- **Owned & Authenticated Chains**: All nulltrace firewall rules reside inside owned chains (`NULLTRACE_OUTPUT`, `NULLTRACE_INPUT`, `NULLTRACE_FORWARD`, `NULLTRACE_NAT_OUTPUT`, `NULLTRACE_MANGLE_*`, and `NULLTRACE_V6_*`), each authenticated with ownership markers (`nulltrace-owned`) before mutation or reuse.
+- **Atomic Activation Without Global Flushes**: Nulltrace never flushes host firewall tables (`iptables -F`) nor does it wipe global connection tracking state (`conntrack -F`). Unrelated policies from UFW, Docker, VPNs, or administrator configurations remain completely untouched. Rules are activated via atomic priority-1 jump insertions.
 - **Fail-Closed Rollback**: If any rule fails during startup or if the process receives SIGINT/SIGTERM, nulltrace triggers an immediate rollback that removes jump rules and deletes custom chains.
 
-### ✅ Egress Lockdown & Conntrack Isolation
-- **Connection Tracking Isolation**: Pre-existing direct TCP connections cannot bypass Tor. Nulltrace uses connection marking (`CONNMARK`) to isolate Tor daemon flows. In `OUTPUT`, all application egress must either route via loopback or match Tor/excluded rules; any pre-existing cleartext flow hits default DROP.
-- **Strict Default Deny**: Filter table chains drop all unauthorized outgoing/incoming traffic.
+### ✅ Egress Lockdown, Masked Marks & Conntrack Isolation
+- **Connection Tracking & Namespaced Marks**: Pre-existing direct TCP connections cannot bypass Tor. Nulltrace isolates Tor daemon flows using a 16-bit masked CONNMARK (`0x4e540000/0xffff0000`), ensuring unrelated packet marks used by host VPNs, QoS, or policy routing survive unmolested.
+- **Strict Default Deny & No Accidental Inbound Allow**: Filter table chains drop all unauthorized outgoing/incoming traffic. Outbound destination exclusions remain strictly outbound; excluding an outbound subnet never opens an inbound ACCEPT hole in the host firewall.
 - **Inbound Stealth Firewall**: Blocks unsolicited inbound probes on public networks while maintaining DHCP and loopback operation.
 
-### ✅ Protocol-Accurate DNS Policy
+### ✅ Protocol-Accurate DNS Policy & Tor Listener Verification
 - **UDP Port 53 Redirection**: Outbound UDP DNS queries are intercepted in NAT and redirected to Tor's `DNSPort` (default port 5353).
 - **TCP Port 53 Reset**: Outbound TCP DNS (port 53) is explicitly rejected with `tcp-reset` at the packet filter level and bypassed in NAT. Tor's DNSPort operates over UDP; wire-format DNS is never sent to TransPort.
-- **Protocol-Level Health Checks**: Startup verifies that Tor `DNSPort` actively responds to real DNS query packets (preventing port collisions with mDNS/avahi).
+- **Process & Protocol Verification**: Startup verifies that Tor `DNSPort` actively responds to real DNS query packets and verifies socket/listener ownership via `ss` and socket UIDs matching the intended Tor daemon.
+- **IPv4-Only Listener Policy**: The Tor listener address is strictly restricted to `127.0.0.1`. IPv6 listener binding (`::1`) is rejected until native IPv6 transparent interception is implemented.
 
 ### ✅ Fail-Closed IPv6 Policy
 - **Blocked, Not Proxied**: Until full IPv6 transparent proxying is available, all IPv6 application traffic is strictly blocked (`check=True` on all `ip6tables` operations).
 - **Hard Startup Verification**: If IPv6 is enabled on the host and `ip6tables` fails or is absent, startup aborts immediately. Dual-stack systems fail closed rather than leaking over IPv6.
 
-### ✅ Teardown State Machine & Durable Recovery
-- **Explicit State Transitions**: Transitions through `INACTIVE` -> `ACTIVATING` -> `ACTIVE` -> `RESTORING` -> `INACTIVE` or `RESTORE_FAILED`.
-- **Preserved Backups**: If any restoration step fails during `--stop`, the state transitions to `RESTORE_FAILED`, non-zero exit is returned, and all backups are preserved in `/var/lib/nulltrace/` for manual recovery.
-- **Session-Bound Backups**: Every activation session receives a unique session ID (`session_<id>`). Stale backups from previous runs are never reused.
-- **Durable Atomic Writes**: All configuration and state files are written using temporary files, fsync, and atomic replacement to prevent corruption on sudden power loss.
-- **PATH Hardening**: Privileged operations resolve binaries strictly through trusted system directories (`/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`).
+### ✅ Crash/Reboot-Safe State Machine & Durable Recovery
+- **Enforcement Truth Over Disk State**: Disk state describes recovery intent; live kernel rules prove protection. Persisted `ACTIVE` state without live firewall rules (e.g. after host reboot or crash) is automatically reconciled to `RECOVERY_REQUIRED`, preventing false active reports.
+- **Cross-Process Session Binding**: Every activation session receives a unique session ID (`session_<id>`). A fresh `--stop` or `--recover` process automatically discovers and binds to the active session directory and restores its exact backups.
+- **Explicit Lifecycle States**: Full state machine transitions through `INACTIVE` -> `PREPARING` -> `ACTIVE` -> `RESTORING` -> `INACTIVE`, `RESTORE_FAILED`, or `RECOVERY_REQUIRED`.
+- **Tri-State Teardown Verification**: Teardown verification distinguishes between clean removal (`VERIFIED_CLEAN`), remaining rules (`VERIFIED_DIRTY`), and inspection errors (`VERIFICATION_FAILED`). Recovery state is never deleted unless teardown is proven clean.
+- **Durable Atomic Writes**: All configuration, state, and backup files are written using temporary files, fsync, and atomic replacement, preserving existing restrictive permissions (e.g. 0600 or 0640 for `torrc`).
+- **Execution Hardening**: Privileged operations execute in a minimal sanitized environment (stripping `LD_*`, `PYTHON*`, `*PROXY*`, and `TMPDIR`) with trusted binary resolution.
+- **Deterministic Identity Rotation**: `--new-ip` requires definitive Tor ControlPort `SIGNAL NEWNYM` authentication and never falls back to `pkill -HUP`.
+- **Proxy-Safe IP Checks**: `--ip` status queries bypass ambient proxy variables and enforce strict type and address parsing for IPv4 and IPv6 exit nodes.
 
 ---
 
@@ -138,6 +142,7 @@ sudo nulltrace --start --circuit-time 1800
 | `--start` | `-s` | Start Tor transparent proxying | `sudo nulltrace --start` |
 | `--stop` | `-x` | Teardown routing and restore system state | `sudo nulltrace --stop` |
 | `--force-stop` | | Force teardown even if state file is inactive | `sudo nulltrace --force-stop` |
+| `--recover` | | Recover system state from persistent metadata & backups | `sudo nulltrace --recover` |
 | `--status` | | Display status and session diagnostics | `nulltrace --status` |
 | `--ip` | `-i` | Check public IP via Tor check API | `nulltrace --ip` |
 | `--new-ip` | `-n` | Request new Tor identity | `sudo nulltrace --new-ip` |
@@ -158,10 +163,12 @@ sudo nulltrace --start --circuit-time 1800
 
 ### Crash Recovery & `RESTORE_FAILED`
 If a stop operation is interrupted or encounters an error:
-1. The session state is marked `RESTORE_FAILED`.
+1. The session state is marked `RESTORE_FAILED` or `RECOVERY_REQUIRED`.
 2. Backups and recovery metadata are preserved in `/var/lib/nulltrace/session_<id>/`.
 3. To recover, run:
    ```bash
+   sudo nulltrace --recover
+   # or
    sudo nulltrace --stop
    ```
 4. If manual intervention is required, inspect `/var/lib/nulltrace/session_<id>/metadata.json` for backed-up configurations and original hardware MAC addresses.

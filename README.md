@@ -302,18 +302,6 @@ sudo python3 install.py --uninstall
 
 ---
 
-## 📅 Planned Features / TODO (Under Research)
-
-The following advanced anti-forensics features have been proposed and are currently under research for future implementation:
-
-*   **Memory Locking (`mlockall`)**: Pinning the `nulltrace` process memory to physical RAM to prevent any sensitive configuration data or routing states from being written to disk via the Linux Swap file.
-*   **Swap Disablement (`swapoff -a`)**: System-wide, temporary disablement of the Linux Swap partition during active routing to guarantee a 100% amnesic session in the event of a physical hardware seizure.
-*   **Persistent Lockdown (Boot Kill-Switch)**: An optional setting to permanently modify default iptables to DROP all traffic on boot, enforcing a fail-closed environment where internet access is physically impossible unless `nulltrace` is actively running.
-*   **Pluggable Transports (`obfs4`)**: Support for Tor bridge obfuscation to evade Deep Packet Inspection (DPI) and bypass ISP-level Tor blocking.
-*   **Native `nftables` Migration (Architecture)**: As modern Linux distributions deprecate `iptables`, a future refactor to dynamically generate `nftables` rulesets or interact via the Netlink API will ensure long-term, future-proof routing compatibility.
-
----
-
 ## 🤝 Contributing
 
 Contributions are welcome! Please follow these guidelines:

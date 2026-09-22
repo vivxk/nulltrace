@@ -1,0 +1,20 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# State and backup artifacts
+*.bak
+*.failed
+*.lock
+state.json
+
+# Environment and IDE files
+.vscode/
+.idea/
+.env
+.venv
+env/
+venv/
+.DS_Store
+Thumbs.db

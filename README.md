@@ -1,79 +1,92 @@
 # nulltrace
 
-**Advanced Privacy Tool with Enhanced Security Features**
+**Advanced Privacy Tool with Hardened Transparent Tor Proxying**
 
-nulltrace routes system traffic through the Tor network on Linux using iptables transparent proxying. It includes DNS leak checks, tight egress rules, and safe backup/restore around network and Tor configuration changes.
+nulltrace routes system traffic through the Tor network on Linux using iptables transparent proxying. It enforces strict egress filtering, isolated connection tracking, transactional owned firewall chains, and fail-closed IPv6 protection.
 
 ![nulltrace](https://img.shields.io/badge/Privacy-Enhanced-brightgreen)
-![Security](https://img.shields.io/badge/Security-Fixed-red)
+![Security](https://img.shields.io/badge/Security-Hardened-red)
 ![Platform](https://img.shields.io/badge/Platform-Linux-blue)
+![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
 
 ---
 
-## 🚀 New Features in nulltrace
+## 🚀 Key Security Architecture
 
-### ✅ Security Enhancements
-- **Command Injection Protection**: Validates inputs; subprocess uses argv lists (no shell)
-- **DNS Leak Detection**: `resolv.conf` checks and sample `dig` lookups
-- **Full egress lockdown**: All TCP via Tor, DNS UDP redirected, other UDP/ICMP blocked, IPv6 blocked
-- **Atomic Operations**: Backup/restore in `/run/nulltrace/` with safe start/stop guards
+### ✅ Transactional & Non-Destructive Firewall Architecture
+- **Owned Custom Chains**: All nulltrace firewall rules reside inside owned chains (`NULLTRACE_OUTPUT`, `NULLTRACE_INPUT`, `NULLTRACE_FORWARD`, `NULLTRACE_NAT_OUTPUT`, `NULLTRACE_MANGLE_*`, and `NULLTRACE_V6_*`).
+- **Atomic Activation**: Nulltrace never flushes host firewall tables (`iptables -F`). Unrelated policies from UFW, Docker, or administrator configurations remain untouched. Rules are activated via atomic jump insertions at chain priority 1.
+- **Fail-Closed Rollback**: If any rule fails during startup or if the process receives SIGINT/SIGTERM, nulltrace triggers an immediate rollback that removes jump rules and deletes custom chains.
 
-### ✅ Improved Functionality
-- **Enhanced DNS Leak Test**: `resolv.conf` + resolver samples (no third-party logging)
-- **Better Error Handling**: Rollback on failed start; no backup overwrite on re-start
-- **Input Validation**: Config limited to `~/.config/nulltrace/`
-- **Tor NEWNYM**: Control port when available, HUP fallback
+### ✅ Egress Lockdown & Conntrack Isolation
+- **Connection Tracking Isolation**: Pre-existing direct TCP connections cannot bypass Tor. Nulltrace uses connection marking (`CONNMARK`) to isolate Tor daemon flows. In `OUTPUT`, all application egress must either route via loopback or match Tor/excluded rules; any pre-existing cleartext flow hits default DROP.
+- **Strict Default Deny**: Filter table chains drop all unauthorized outgoing/incoming traffic.
+- **Inbound Stealth Firewall**: Blocks unsolicited inbound probes on public networks while maintaining DHCP and loopback operation.
 
-### ✅ Additional Features
-- **Comprehensive Status**: Tor service and routing status (`--status`)
-- **Minimal Logging**: No log files by default; optional `--verbose` on stderr only
+### ✅ Protocol-Accurate DNS Policy
+- **UDP Port 53 Redirection**: Outbound UDP DNS queries are intercepted in NAT and redirected to Tor's `DNSPort` (default port 5353).
+- **TCP Port 53 Reset**: Outbound TCP DNS (port 53) is explicitly rejected with `tcp-reset` at the packet filter level and bypassed in NAT. Tor's DNSPort operates over UDP; wire-format DNS is never sent to TransPort.
+- **Protocol-Level Health Checks**: Startup verifies that Tor `DNSPort` actively responds to real DNS query packets (preventing port collisions with mDNS/avahi).
+
+### ✅ Fail-Closed IPv6 Policy
+- **Blocked, Not Proxied**: Until full IPv6 transparent proxying is available, all IPv6 application traffic is strictly blocked (`check=True` on all `ip6tables` operations).
+- **Hard Startup Verification**: If IPv6 is enabled on the host and `ip6tables` fails or is absent, startup aborts immediately. Dual-stack systems fail closed rather than leaking over IPv6.
+
+### ✅ Teardown State Machine & Durable Recovery
+- **Explicit State Transitions**: Transitions through `INACTIVE` -> `ACTIVATING` -> `ACTIVE` -> `RESTORING` -> `INACTIVE` or `RESTORE_FAILED`.
+- **Preserved Backups**: If any restoration step fails during `--stop`, the state transitions to `RESTORE_FAILED`, non-zero exit is returned, and all backups are preserved in `/var/lib/nulltrace/` for manual recovery.
+- **Session-Bound Backups**: Every activation session receives a unique session ID (`session_<id>`). Stale backups from previous runs are never reused.
+- **Durable Atomic Writes**: All configuration and state files are written using temporary files, fsync, and atomic replacement to prevent corruption on sudden power loss.
+- **PATH Hardening**: Privileged operations resolve binaries strictly through trusted system directories (`/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`).
 
 ---
 
 ## 📋 Requirements
 
-- **Linux Distribution**: Ubuntu, Debian, Kali Linux, Parrot OS, etc.
-- **Python 3.6+**
-- **Tor Service**: Must be installed and running
-- **Root Access**: Required for installation and network configuration
-- **Dependencies**: `iptables`, `ip6tables`, Tor systemd service (Optional: `macchanger` for MAC randomization)
+- **Linux Distribution**: Ubuntu, Debian, Kali Linux, Parrot OS, Arch Linux, Alpine, etc.
+- **Python 3.8+**
+- **Tor Service**: Installed and configured
+- **Root Access**: Required for network configuration and packet filtering
+- **Dependencies**: `iptables`, `ip6tables`, Tor (Optional: `macchanger` for MAC randomization)
 
 ---
 
 ## 🔧 Installation
 
-### Method 1: Manual Installation (Recommended)
+### Method 1: Installer Script
 
 ```bash
-# 1. Clone or download the repository
+# 1. Clone repository
 git clone https://github.com/vivxk/nulltrace.git
 cd nulltrace
 
-# 2. Run the installation script as root
+# 2. Run installer as root
 sudo python3 install.py
 
-# 3. Follow the prompts:
-#    - Press Y to install
-#    - Press N to uninstall existing version
-#    - Press Q to exit
+# Options:
+#   Press Y to install
+#   Press N to safely uninstall
+#   Press Q to exit
 ```
 
 ### Method 2: Manual Setup
 
 ```bash
-# 1. Copy files to system locations
-sudo mkdir -p /usr/share/nulltrace
-sudo cp nulltrace.py /usr/share/nulltrace/
-sudo chmod +x /usr/share/nulltrace/nulltrace.py
-
-# 2. Create launcher script
-echo '#!/bin/sh' | sudo tee /usr/bin/nulltrace > /dev/null
-echo 'exec python3 /usr/share/nulltrace/nulltrace.py "$@"' | sudo tee -a /usr/bin/nulltrace > /dev/null
-sudo chmod +x /usr/bin/nulltrace
-
-# 3. Install dependencies
+# 1. Install dependencies
 sudo apt update
 sudo apt install tor iptables ip6tables
+
+# 2. Copy files to system directories
+sudo mkdir -p /usr/share/nulltrace
+sudo cp nulltrace.py /usr/share/nulltrace/
+sudo chmod 755 /usr/share/nulltrace/nulltrace.py
+
+# 3. Create launcher
+cat << 'EOF' | sudo tee /usr/bin/nulltrace > /dev/null
+#!/bin/sh
+exec /usr/bin/python3 /usr/share/nulltrace/nulltrace.py "$@"
+EOF
+sudo chmod 755 /usr/bin/nulltrace
 ```
 
 ---
@@ -83,248 +96,85 @@ sudo apt install tor iptables ip6tables
 ### Basic Commands
 
 ```bash
-# Start nulltrace (route all traffic through Tor)
+# Start nulltrace (route system traffic through Tor)
 sudo nulltrace --start
 
 # Stop nulltrace and restore normal networking
 sudo nulltrace --stop
 
-# Show current Tor IP
+# Show current public IP and Tor exit status
 nulltrace --ip
 
-# Get a new Tor IP address
+# Request new Tor identity (new IP)
 sudo nulltrace --new-ip
 
-# Show detailed status
+# Show detailed status (service, ports, routing, session state)
 nulltrace --status
 ```
 
-### Advanced Features
+### Advanced Options
 
 ```bash
-# Auto-rotate IP every 30 minutes
-sudo nulltrace --auto --time 1800
+# Start with MAC address randomization on the primary egress interface
+sudo nulltrace --start --mac-randomize
 
-# Test for DNS leaks
+# Auto-rotate Tor IP every 15 minutes (900 seconds)
+sudo nulltrace --auto --time 900
+
+# Specify exit node country code (e.g., Switzerland)
+sudo nulltrace --start --exit-country CH
+
+# Run DNS leak check (checks resolv.conf and tests Tor DNSPort responsiveness)
 nulltrace --dnsleak
 
-# Set custom circuit lifetime (default: 3600 seconds)
+# Set Tor circuit lifetime (seconds)
 sudo nulltrace --start --circuit-time 1800
 ```
 
-### Complete Option Reference
+### Option Reference Table
 
 | Option | Short Form | Description | Example |
-|--------|------------|-------------|---------|
-| `--start` | `-s` | Start routing traffic through Tor | `sudo nulltrace --start` |
-| `--stop` | `-x` | Stop Tor routing and restore backups | `sudo nulltrace --stop` |
-| `--force-stop` | | Restore from backup if state file is missing | `sudo nulltrace --force-stop` |
-| `--ip` | `-i` | Show current Tor IP (Tor check API) | `nulltrace --ip` |
-| `--new-ip` | `-n` | Request new Tor identity/IP | `sudo nulltrace --new-ip` |
-| `--auto` | `-a` | Auto-change IP at intervals | `sudo nulltrace --auto` |
-| `--time <sec>` | `-t` | Set auto-change interval | `--time 300` (5 min) |
-| `--circuit-time <sec>` | | Set Tor circuit lifetime | `--circuit-time 1800` |
-| `--status` | | Show detailed status | `nulltrace --status` |
-| `--dnsleak` | | Test for DNS leaks | `nulltrace --dnsleak` |
-| `--verbose` | | Debug messages on stderr | `nulltrace --verbose --status` |
-| `--mac-randomize` | | Randomize physical MAC address | `sudo nulltrace --start --mac-randomize` |
-| `--exit-country <cc>` | | Force Tor exit node to specific country | `sudo nulltrace --start --exit-country us` |
-| `--save [file]` | | Save configuration to file | `nulltrace --save myconfig.json` |
-| `--load [file]` | | Load configuration from file | `nulltrace --load myconfig.json` |
-| `--show-config` | | Show current configuration | `nulltrace --show-config` |
+|---|---|---|---|
+| `--start` | `-s` | Start Tor transparent proxying | `sudo nulltrace --start` |
+| `--stop` | `-x` | Teardown routing and restore system state | `sudo nulltrace --stop` |
+| `--force-stop` | | Force teardown even if state file is inactive | `sudo nulltrace --force-stop` |
+| `--status` | | Display status and session diagnostics | `nulltrace --status` |
+| `--ip` | `-i` | Check public IP via Tor check API | `nulltrace --ip` |
+| `--new-ip` | `-n` | Request new Tor identity | `sudo nulltrace --new-ip` |
+| `--auto` | `-a` | Auto-rotate identity at intervals | `sudo nulltrace --auto --time 600` |
+| `--time <sec>` | `-t` | Interval for `--auto` in seconds | `--time 600` |
+| `--circuit-time <sec>` | | Set Tor MaxCircuitDirtiness | `--circuit-time 1800` |
+| `--mac-randomize` | | Randomize egress interface MAC address | `sudo nulltrace --start --mac-randomize` |
+| `--exit-country <cc>` | `-c` | 2-letter ISO country code for exit node | `sudo nulltrace --start --exit-country IS` |
+| `--dnsleak` | | Test DNS configuration and DNSPort health | `nulltrace --dnsleak` |
+| `--save [file]` | | Save settings under `~/.config/nulltrace/` | `nulltrace --save myconfig.json` |
+| `--load [file]` | | Load settings from `~/.config/nulltrace/` | `nulltrace --load myconfig.json` |
+| `--show-config` | | Display current configuration | `nulltrace --show-config` |
+| `--verbose` | | Enable debug messages on stderr | `nulltrace --verbose --status` |
 
 ---
 
-### Configuration Management
+## 🛡️ Recovery & Troubleshooting
 
-nulltrace supports persistent configuration to save and restore your settings:
+### Crash Recovery & `RESTORE_FAILED`
+If a stop operation is interrupted or encounters an error:
+1. The session state is marked `RESTORE_FAILED`.
+2. Backups and recovery metadata are preserved in `/var/lib/nulltrace/session_<id>/`.
+3. To recover, run:
+   ```bash
+   sudo nulltrace --stop
+   ```
+4. If manual intervention is required, inspect `/var/lib/nulltrace/session_<id>/metadata.json` for backed-up configurations and original hardware MAC addresses.
 
+### Non-Destructive Uninstallation
+To uninstall nulltrace without damaging unrelated firewall rules:
 ```bash
-# Save current configuration
-nulltrace --save
-
-# Save with custom filename
-nulltrace --save my_settings.json
-
-# Load saved configuration
-nulltrace --load my_settings.json
-
-# Show current configuration
-nulltrace --show-config
-```
-
-**Configuration includes:**
-- Circuit time settings
-- Network configuration (ports, excluded networks/IPs)
-- All customizable parameters
-
-**Note:** Configuration is entirely optional and never loads automatically. Saved files live in `~/.config/nulltrace/`.
-
----
-
-## 🛡️ Security Features
-
-### Command Injection Protection
-- Validates domain names and IPs with strict regex
-- All subprocess calls use argument lists (no shell)
-
-### Traffic Isolation
-- **TCP**: all outbound TCP NAT-redirected to Tor TransPort
-- **DNS**: UDP and TCP port 53 aggressively redirected to Tor DNSPort
-- **Inbound Stealth Firewall**: `INPUT` chain locked down to drop all unrequested inbound probes, making you invisible on public Wi-Fi
-- **Other UDP / ICMP**: dropped (except loopback, Tor user, excluded LAN CIDRs)
-- **IPv6**: blocked via ip6tables while active using safe, non-destructive rules
-
-### Privilege Management
-- Requires root only for `--start`, `--stop`, `--force-stop`, `--new-ip`, and `--auto`
-- `--ip`, `--dnsleak`, and `--status` run without root
-
-### Atomic Operations
-- Backs up IPv4/IPv6 iptables to `/run/nulltrace/` before changes
-- Refuses `--start` if already active (preserves pristine backups)
-- Failed start restores rules but keeps backup for `--force-stop`
-
----
-
-## 📊 Examples
-
-### Start with Custom Circuit Time
-```bash
-sudo nulltrace --start --circuit-time 900
-# Circuits will expire after 15 minutes
-```
-
-### Auto-Rotate IP Every 10 Minutes
-```bash
-sudo nulltrace --auto --time 600
-# Press Ctrl+C to stop
-```
-
-### Comprehensive Status Check
-```bash
-nulltrace --status
-# Shows: Tor service status, routing status, current IP
-```
-
-### DNS Leak Test
-```bash
-nulltrace --dnsleak
-# Tests multiple DNS resolvers and checks for leaks
-```
-
----
-
-## 🔍 Troubleshooting
-
-### Common Issues
-
-**Tor service not running:**
-```bash
-sudo systemctl start tor
-sudo systemctl enable tor
-```
-
-**Permission denied:**
-```bash
-# Use sudo with all commands that modify network settings
-sudo nulltrace --start
-```
-
-**DNS issues:**
-```bash
-# Test DNS leak detection
-nulltrace --dnsleak
-
-# If leaks detected, restart the setup
-sudo nulltrace --stop
-sudo nulltrace --start
-```
-
-**Debug output (optional):**
-```bash
-nulltrace --verbose --status
-```
-
----
-
-## 📝 Logging
-
-nulltrace does **not** write log files by default (privacy-focused). Use `--verbose` for debug messages on stderr only. IPs and DNS queries are not logged.
-
----
-
-## 🚫 Disclaimer
-
-**Ethical Use Only:**
-- This tool is for privacy, security research, and educational purposes
-- Do not use for illegal activities
-- Respect terms of service of networks you access
-- The authors are not responsible for misuse
-
-**Legal Considerations:**
-- Using Tor may be restricted in some jurisdictions
-- Some websites may block Tor exit nodes
-- Your ISP may have policies about Tor usage
-
----
-
-## 🔄 Uninstallation
-
-```bash
-# Run the uninstaller directly
 sudo python3 install.py --uninstall
 ```
-*Note: The uninstaller features an elite "Anti-Brick" Hard Flush failsafe to mathematically guarantee your firewall is cleared, even if the python script encounters an execution error.*
-
----
-
-## 📚 Technical Details
-
-### How It Works
-1. **Configuration**: Appends marked block to `/etc/tor/torrc` (TransPort, DNSPort, circuit time)
-2. **Network Rules**: Backs up iptables, applies NAT + filter rules, blocks IPv6 egress
-3. **DNS Routing**: Redirects UDP/53 to Tor; blocks other UDP
-4. **IP Rotation**: `SIGNAL NEWNYM` via Tor control port, or HUP fallback
-5. **Restore on stop**: iptables and Tor config revert from backups
-
-### Files Modified
-- `/etc/tor/torrc` - Tor configuration (nulltrace block)
-- `/etc/tor/torrc.nulltrace.bak` - One-time backup of original config
-- `/run/nulltrace/iptables.v4.bak` - IPv4 iptables backup while active
-- `/run/nulltrace/iptables.v6.bak` - IPv6 iptables backup (if available)
-- `/run/nulltrace/state.json` - active session marker
-- `~/.config/nulltrace/` - user JSON settings only
-
-### Network Changes
-- NAT: Tor user bypass, DNS redirect, excluded LAN, all TCP → TransPort
-- filter: allow Tor/LAN/TCP, drop other UDP and ICMP
-- ip6tables: default DROP on OUTPUT while active
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please follow these guidelines:
-- Fork the repository
-- Create a feature branch
-- Submit pull requests
-- Report issues with detailed information
+*Note: Uninstallation attempts clean restoration first. If stop fails, it preserves recovery records and exits non-zero rather than indiscriminately wiping the host firewall.*
 
 ---
 
 ## 📜 License
 
-This project is licensed under the MIT License. See the LICENSE file for details.
-
----
-
-## 📞 Support
-
-For issues, questions, or suggestions:
-- Check the GitHub issues page
-- Review the documentation
-- Use `nulltrace --verbose` for stderr debug output
-
----
-
-**Stay Private, Stay Secure! 🔒**
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.

@@ -2,6 +2,7 @@
 import argparse
 import os
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -11,22 +12,77 @@ TRUSTED_BIN_DIRS = ("/usr/sbin", "/usr/bin", "/sbin", "/bin")
 
 
 def resolve_trusted_binary(name: str) -> Optional[str]:
-    """Resolve binary strictly to a trusted system directory (NT-006)."""
+    """
+    Resolve binary strictly to a trusted system directory (NT-006, P1-5).
+    Rejects relative lookups, path traversals, non-root-owned binaries,
+    group/world-writable binaries, non-regular files, and symlinks resolving
+    outside approved trusted directories.
+    """
     if not name or not isinstance(name, str):
         return None
     p = Path(name)
+    candidates: List[Path] = []
     if p.is_absolute():
         p_str = p.as_posix()
         for tdir in TRUSTED_BIN_DIRS:
-            if p_str == f"{tdir}/{p.name}" and p.is_file() and os.access(p_str, os.X_OK):
-                return p_str
-        return None
-    if p.name != name or "/" in name or "\\" in name or ".." in name:
-        return None
-    for directory in TRUSTED_BIN_DIRS:
-        candidate = Path(directory) / name
-        if candidate.is_file() and os.access(str(candidate), os.X_OK):
-            return str(candidate)
+            if p_str == f"{tdir}/{p.name}":
+                candidates.append(p)
+                break
+        if not candidates:
+            return None
+    else:
+        if p.name != name or "/" in name or "\\" in name or ".." in name:
+            return None
+        for directory in TRUSTED_BIN_DIRS:
+            candidates.append(Path(directory) / name)
+
+    for candidate in candidates:
+        if not (candidate.exists() or os.path.islink(str(candidate))):
+            continue
+        try:
+            lst = os.lstat(str(candidate))
+        except OSError:
+            continue
+
+        if stat.S_ISLNK(lst.st_mode):
+            if hasattr(lst, "st_uid") and (os.name != "nt" or getattr(os, "_force_posix_security_checks", False)):
+                if lst.st_uid != 0:
+                    continue
+            try:
+                target = candidate.resolve()
+            except OSError:
+                continue
+            target_str = target.as_posix()
+            target_in_trusted = any(
+                target_str == f"{tdir}/{target.name}" or target_str.startswith(f"{tdir}/")
+                for tdir in TRUSTED_BIN_DIRS
+            )
+            if not target_in_trusted:
+                continue
+            try:
+                target_st = os.stat(str(target))
+            except OSError:
+                continue
+        else:
+            if not stat.S_ISREG(lst.st_mode):
+                continue
+            target_st = lst
+
+        if not stat.S_ISREG(target_st.st_mode):
+            continue
+
+        if not os.access(str(candidate), os.X_OK):
+            continue
+
+        if target_st.st_mode & 0o022:
+            continue
+
+        if hasattr(target_st, "st_uid") and (os.name != "nt" or getattr(os, "_force_posix_security_checks", False)):
+            if target_st.st_uid != 0:
+                continue
+
+        return candidate.as_posix()
+
     return None
 
 
@@ -157,20 +213,26 @@ class FirewallInspectionResult:
 
 def inspect_live_nulltrace_rules() -> str:
     """
-    Tri-state inspection of live iptables/ip6tables rulesets (P1.5):
-    - CLEAN: binaries ran successfully and no NULLTRACE chains or rules exist.
+    Tri-state inspection of live iptables/ip6tables rulesets (P1.5, P1-7):
+    - CLEAN: binaries ran successfully and no NULLTRACE chains or rules exist in any table.
     - ACTIVE: binaries ran successfully and NULLTRACE chains or rules exist.
-    - UNKNOWN: iptables binary missing or command errored.
+    - UNKNOWN: iptables or ip6tables binary missing, unusable, or inspection command errored.
     """
     iptables_bin = resolve_trusted_binary("iptables")
-    if not iptables_bin:
+    ip6tables_bin = resolve_trusted_binary("ip6tables")
+    if not iptables_bin or not ip6tables_bin:
         return FirewallInspectionResult.UNKNOWN
 
     found_active = False
-    for table in ("filter", "nat", "mangle"):
+    all_tables = ("filter", "nat", "mangle", "raw", "security")
+
+    for table in all_tables:
         try:
             res = run_trusted([iptables_bin, "-t", table, "-S"], check=False)
             if res.returncode != 0:
+                err = (res.stderr or "").lower()
+                if "table does not exist" in err or "no such file or directory" in err or "protocol not supported" in err:
+                    continue
                 return FirewallInspectionResult.UNKNOWN
             for line in res.stdout.splitlines():
                 if "NULLTRACE" in line:
@@ -178,18 +240,19 @@ def inspect_live_nulltrace_rules() -> str:
         except Exception:
             return FirewallInspectionResult.UNKNOWN
 
-    ip6tables_bin = resolve_trusted_binary("ip6tables")
-    if ip6tables_bin:
-        for table in ("filter", "mangle"):
-            try:
-                res = run_trusted([ip6tables_bin, "-t", table, "-S"], check=False)
-                if res.returncode != 0:
-                    return FirewallInspectionResult.UNKNOWN
-                for line in res.stdout.splitlines():
-                    if "NULLTRACE" in line:
-                        found_active = True
-            except Exception:
+    for table in all_tables:
+        try:
+            res = run_trusted([ip6tables_bin, "-t", table, "-S"], check=False)
+            if res.returncode != 0:
+                err = (res.stderr or "").lower()
+                if "table does not exist" in err or "no such file or directory" in err or "protocol not supported" in err:
+                    continue
                 return FirewallInspectionResult.UNKNOWN
+            for line in res.stdout.splitlines():
+                if "NULLTRACE" in line:
+                    found_active = True
+        except Exception:
+            return FirewallInspectionResult.UNKNOWN
 
     if found_active:
         return FirewallInspectionResult.ACTIVE
@@ -300,22 +363,35 @@ def uninstall_nulltrace(
                     print("[!] Uninstallation aborted. Run with --emergency-flush-all-rules to force wipe.")
                     sys.exit(1)
 
-            # Only executed if explicitly requested and confirmed
+            # Only executed if explicitly requested and confirmed (P2-8)
             print("[!] Executing emergency firewall table wipe as requested...")
             iptables_bin = resolve_trusted_binary("iptables")
             ip6tables_bin = resolve_trusted_binary("ip6tables")
+            netfilter_tables = ("filter", "nat", "mangle", "raw", "security")
+
             if iptables_bin:
-                run_trusted([iptables_bin, "-F"], check=False)
-                run_trusted([iptables_bin, "-t", "nat", "-F"], check=False)
-                run_trusted([iptables_bin, "-t", "mangle", "-F"], check=False)
+                for table in netfilter_tables:
+                    run_trusted([iptables_bin, "-t", table, "-F"], check=False)
+                    run_trusted([iptables_bin, "-t", table, "-X"], check=False)
                 for chain in ["OUTPUT", "INPUT", "FORWARD"]:
                     run_trusted([iptables_bin, "-P", chain, "ACCEPT"], check=False)
+
             if ip6tables_bin:
-                run_trusted([ip6tables_bin, "-F"], check=False)
-                run_trusted([ip6tables_bin, "-t", "mangle", "-F"], check=False)
+                for table in netfilter_tables:
+                    run_trusted([ip6tables_bin, "-t", table, "-F"], check=False)
+                    run_trusted([ip6tables_bin, "-t", table, "-X"], check=False)
                 for chain in ["OUTPUT", "INPUT", "FORWARD"]:
                     run_trusted([ip6tables_bin, "-P", chain, "ACCEPT"], check=False)
-            print("[+] Emergency firewall flush complete.")
+
+            # P1-6: Verify live firewall state is CLEAN before removing recovery tooling
+            post_emergency_status = inspect_live_nulltrace_rules()
+            if post_emergency_status != FirewallInspectionResult.CLEAN:
+                print(f"[!] ERROR: Emergency firewall flush could not verify clean firewall state (status: {post_emergency_status}).")
+                print("    NullTrace recovery tooling (/usr/share/nulltrace, /usr/bin/nulltrace) retained.")
+                print("    Uninstallation aborted to prevent leaving unrecoverable orphaned firewall rules.")
+                sys.exit(1)
+
+            print("[+] Emergency firewall flush complete and clean firewall state verified.")
 
     try:
         for path in (
@@ -370,7 +446,7 @@ def main():
     parser.add_argument(
         "--emergency-flush-all-rules",
         action="store_true",
-        help="Opt-in emergency fallback to wipe all firewall tables if stop fails (destructive)",
+        help="Opt-in emergency fallback to wipe all firewall tables (filter, nat, mangle, raw, security) if stop fails (destructive)",
     )
 
     args, unknown = parser.parse_known_args()

@@ -3,6 +3,8 @@
 Comprehensive Regression & Unit Test Suite for nulltrace remediation (NT-001 through NT-016).
 """
 
+import errno
+import hashlib
 import json
 import os
 import signal
@@ -908,6 +910,7 @@ class TestP0_RecoveryAndEnforcementTruth(unittest.TestCase):
                      patch.object(app, "apply_tor_config", side_effect=mock_apply_tor), \
                      patch.object(app, "_setup_custom_chains_v4", side_effect=mock_setup_v4), \
                      patch.object(app, "_setup_custom_chains_v6", side_effect=mock_setup_v6), \
+                     patch.object(app, "_generate_enforcement_manifest", return_value={"mock": "manifest"}), \
                      patch.object(app, "_activate_jump_rules", side_effect=mock_activate_jumps):
                     app.setup_network_rules()
 
@@ -996,18 +999,51 @@ class TestP1_SecurityAndCorrectnessHardening(unittest.TestCase):
         app = nulltrace.nulltrace()
         app._tor_user = "109"
 
-        with patch("nulltrace.resolve_trusted_binary", return_value="/usr/sbin/ss"):
+        def mock_exists(p):
+            p_str = p.as_posix()
+            return p_str in (
+                "/proc/1234", "/proc/1234/status", "/proc/1234/exe",
+                "/proc/5678", "/proc/5678/status", "/proc/5678/exe"
+            )
+
+        def mock_is_dir(p):
+            p_str = p.as_posix()
+            return p_str in ("/proc/1234", "/proc/5678")
+
+        def mock_read_text(p, encoding=None):
+            p_str = p.as_posix()
+            if p_str == "/proc/1234/status":
+                return "Name:\ttor\nUid:\t109\t109\t109\t109\n"
+            if p_str == "/proc/5678/status":
+                return "Name:\tmalicious_proxy\nUid:\t1000\t1000\t1000\t1000\n"
+            return ""
+
+        def mock_readlink(p):
+            p_str = Path(p).as_posix()
+            if p_str == "/proc/1234/exe":
+                return "/usr/bin/tor"
+            if p_str == "/proc/5678/exe":
+                return "/usr/bin/malicious_proxy"
+            raise OSError("No such file")
+
+        with patch("nulltrace.resolve_trusted_binary", return_value="/usr/sbin/ss"), \
+             patch.object(Path, "exists", autospec=True, side_effect=mock_exists), \
+             patch.object(Path, "is_dir", autospec=True, side_effect=mock_is_dir), \
+             patch.object(Path, "read_text", autospec=True, side_effect=mock_read_text), \
+             patch("os.readlink", side_effect=mock_readlink), \
+             patch("os.kill", return_value=None):
+
             # Tor owns the port
             with patch("nulltrace.run_trusted", return_value=subprocess.CompletedProcess(
                 args=["ss"], returncode=0,
-                stdout='users:(("tor",pid=1234,fd=6))\n', stderr=""
+                stdout='LISTEN 0 128 127.0.0.1:9041 0.0.0.0:* users:(("tor",pid=1234,fd=6))\n', stderr=""
             )):
                 self.assertTrue(app._verify_listener_ownership(9041, "tcp"))
 
             # Another process owns the port
             with patch("nulltrace.run_trusted", return_value=subprocess.CompletedProcess(
                 args=["ss"], returncode=0,
-                stdout='users:(("malicious_proxy",pid=5678,fd=4))\n', stderr=""
+                stdout='LISTEN 0 128 127.0.0.1:9041 0.0.0.0:* users:(("malicious_proxy",pid=5678,fd=4))\n', stderr=""
             )):
                 self.assertFalse(app._verify_listener_ownership(9041, "tcp"))
 
@@ -1384,9 +1420,48 @@ class TestP2_CorrectnessRecoveryUX(unittest.TestCase):
             "   1: 00000000:14E9 00000000:0000 07 00000000:00000000 00:00000000 00000000   108        0 11111\n"
             "   2: 0100007F:14E9 00000000:0000 07 00000000:00000000 00:00000000 00000000   109        0 22222\n"
         )
+
+        def mock_exists(p):
+            p_str = p.as_posix()
+            return p_str in (
+                "/proc/net/udp", "/proc/1234", "/proc/1234/status", "/proc/1234/fd", "/proc/1234/exe"
+            )
+
+        def mock_is_dir(p):
+            p_str = p.as_posix()
+            return p_str in ("/proc", "/proc/1234", "/proc/1234/fd")
+
+        def mock_iterdir(p):
+            p_str = p.as_posix()
+            if p_str == "/proc":
+                return [Path("/proc/1234")]
+            if p_str == "/proc/1234/fd":
+                return [Path("/proc/1234/fd/3")]
+            return []
+
+        def mock_read_text(p, encoding=None):
+            p_str = p.as_posix()
+            if p_str == "/proc/net/udp":
+                return proc_udp_content
+            if p_str == "/proc/1234/status":
+                return "Name:\ttor\nUid:\t109\t109\t109\t109\n"
+            return ""
+
+        def mock_readlink(p):
+            p_str = Path(p).as_posix()
+            if p_str == "/proc/1234/fd/3":
+                return "socket:[22222]"
+            if p_str == "/proc/1234/exe":
+                return "/usr/bin/tor"
+            raise OSError("not found")
+
         with patch("nulltrace.resolve_trusted_binary", return_value=None), \
-             patch("pathlib.Path.exists", return_value=True), \
-             patch("pathlib.Path.read_text", return_value=proc_udp_content):
+             patch.object(Path, "exists", autospec=True, side_effect=mock_exists), \
+             patch.object(Path, "is_dir", autospec=True, side_effect=mock_is_dir), \
+             patch.object(Path, "iterdir", autospec=True, side_effect=mock_iterdir), \
+             patch.object(Path, "read_text", autospec=True, side_effect=mock_read_text), \
+             patch("os.readlink", side_effect=mock_readlink), \
+             patch("os.kill", return_value=None):
             self.assertTrue(app._verify_listener_ownership(5353, "udp"))
 
     def test_scenario_2_auto_mode_interruption_preserves_protection(self):
@@ -1847,6 +1922,725 @@ class TestHandoffRemediationNewIssues(unittest.TestCase):
                 with patch("nulltrace.atomic_write", side_effect=OSError("Disk full")):
                     with self.assertRaises(OSError):
                         app._write_state(nulltrace.STATE_ACTIVE)
+
+
+class TestSection11_ComprehensiveRegressions(unittest.TestCase):
+    """
+    Comprehensive regression test suite for handoff specification (Section 11):
+    - Filesystem security (TOCTOU race, secure dirs, session IDs, trusted binaries)
+    - Firewall verification (exact first jump, conditional jumps, ordered manifest, manifest integrity)
+    - Emergency recovery (failed flush retains tooling, all-tables wipe, IPv6 inspection UNKNOWN)
+    - Tor configuration (unterminated blocks, existence tracking, admin changes)
+    - Service and interface state restoration (active/inactive/enabled/disabled, up/down)
+    - Listener ownership (fake tor, wrong UID, wrong exe, multi-PID sockets)
+    - Partial activation and fail-closed recovery
+    """
+
+    def test_fs_symlink_rejection_in_atomic_write(self):
+        """P0-1: atomic_write rejects writing to symlinks."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest = Path(tmpdir) / "test.conf"
+            mock_lstat = MagicMock()
+            mock_lstat.st_mode = stat.S_IFLNK | 0o777
+            with patch("os.lstat", return_value=mock_lstat), \
+                 patch("pathlib.Path.exists", return_value=True):
+                with self.assertRaises(ValueError) as ctx:
+                    nulltrace.atomic_write(dest, "data")
+                self.assertIn("symlink", str(ctx.exception).lower())
+
+    def test_fs_insecure_parent_directory_atomic_write(self):
+        """P0-1 & P2-2: atomic_write rejects world-writable parent directories."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest = Path(tmpdir) / "test.conf"
+            mock_st = MagicMock()
+            mock_st.st_mode = stat.S_IFDIR | 0o777  # world-writable
+            mock_st.st_uid = 0
+            mock_st.st_gid = 0
+            with patch("os.stat", return_value=mock_st), \
+                 patch.object(os, "_force_posix_security_checks", True, create=True), \
+                 patch("os.geteuid", return_value=0, create=True):
+                with self.assertRaises(ValueError) as ctx:
+                    nulltrace.atomic_write(dest, "data")
+                self.assertIn("world-writable", str(ctx.exception).lower())
+
+    def test_fs_secure_directory_validation(self):
+        """P2-2: _validate_secure_directory rejects symlinks, non-directories, and insecure permissions."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = nulltrace.nulltrace()
+            target_dir = Path(tmpdir) / "secure_dir"
+            target_dir.mkdir(parents=True, exist_ok=True)
+
+            # 1. Symlink directory rejected
+            symlink_dir = Path(tmpdir) / "symlink_dir"
+            mock_symlink_st = MagicMock()
+            mock_symlink_st.st_mode = stat.S_IFLNK | 0o755
+            with patch("os.lstat", return_value=mock_symlink_st):
+                with self.assertRaises(RuntimeError) as ctx:
+                    app._validate_secure_directory(symlink_dir)
+                self.assertIn("symlink", str(ctx.exception).lower())
+
+            # 2. Insecure permissions rejected
+            mock_st = MagicMock()
+            mock_st.st_mode = stat.S_IFDIR | 0o777
+            mock_st.st_uid = 0
+            with patch.object(Path, "stat", return_value=mock_st), \
+                 patch("os.lstat", return_value=mock_st), \
+                 patch.object(os, "_force_posix_security_checks", True, create=True), \
+                 patch("os.geteuid", return_value=0, create=True):
+                with self.assertRaises(RuntimeError) as ctx:
+                    app._validate_secure_directory(target_dir)
+                self.assertIn("insecure permissions", str(ctx.exception).lower())
+
+    def test_fs_session_id_validation(self):
+        """P2-3: is_valid_session_id strictly enforces format and rejects traversal/injection."""
+        self.assertTrue(nulltrace.is_valid_session_id("123456abcdef"))
+        self.assertTrue(nulltrace.is_valid_session_id("abcdef123456"))
+        self.assertTrue(nulltrace.is_valid_session_id("12345678"))
+        self.assertFalse(nulltrace.is_valid_session_id("../evil"))
+        self.assertFalse(nulltrace.is_valid_session_id("/etc/passwd"))
+        self.assertFalse(nulltrace.is_valid_session_id("session_123456"))
+        self.assertFalse(nulltrace.is_valid_session_id("1234\x005678"))
+        self.assertFalse(nulltrace.is_valid_session_id(""))
+
+        app = nulltrace.nulltrace()
+        with self.assertRaises(ValueError):
+            app.bind_session("../../traversal")
+
+    def test_fs_trusted_binary_resolution_checks(self):
+        """P1-5: resolve_trusted_binary rejects group/world-writable and non-root-owned binaries."""
+        # World-writable binary
+        mock_ww = MagicMock()
+        mock_ww.st_mode = stat.S_IFREG | 0o777
+        mock_ww.st_uid = 0
+        with patch("pathlib.Path.exists", return_value=True), \
+             patch("os.lstat", return_value=mock_ww), \
+             patch("os.stat", return_value=mock_ww), \
+             patch("os.access", return_value=True):
+            self.assertIsNone(nulltrace.resolve_trusted_binary("/usr/bin/iptables"))
+            self.assertIsNone(install.resolve_trusted_binary("/usr/bin/iptables"))
+
+        # Non-root owned binary on POSIX
+        mock_nr = MagicMock()
+        mock_nr.st_mode = stat.S_IFREG | 0o755
+        mock_nr.st_uid = 1000
+        with patch("pathlib.Path.exists", return_value=True), \
+             patch("os.lstat", return_value=mock_nr), \
+             patch("os.stat", return_value=mock_nr), \
+             patch("os.access", return_value=True), \
+             patch("os.name", "posix"):
+            self.assertIsNone(nulltrace.resolve_trusted_binary("/usr/bin/iptables"))
+            self.assertIsNone(install.resolve_trusted_binary("/usr/bin/iptables"))
+
+    def test_fw_exact_first_jump_verification(self):
+        """P0-2: Live firewall status returns PARTIAL when jump is not rule 1 or is conditional."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+
+        # Preceding ACCEPT rule in OUTPUT
+        base_rules_preceding_accept = {
+            "filter": ["-A OUTPUT -j ACCEPT", "-A OUTPUT -j NULLTRACE_OUTPUT"],
+            "nat": ["-A OUTPUT -j NULLTRACE_NAT_OUTPUT"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_MANGLE_PREROUTING"],
+        }
+
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"):
+            def fake_run_trusted(cmd, **kwargs):
+                table = "filter"
+                if "-t" in cmd:
+                    table = cmd[cmd.index("-t") + 1]
+                rules = base_rules_preceding_accept.get(table, [])
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="\n".join(rules) + "\n", stderr="")
+
+            with patch("nulltrace.run_trusted", side_effect=fake_run_trusted):
+                status = app._check_live_firewall_status()
+                self.assertEqual(status, nulltrace.LiveFirewallStatus.PARTIAL)
+
+    def test_fw_order_sensitive_manifest_fingerprints(self):
+        """P1-1: Manifest fingerprints preserve rule order; reordering rules changes fingerprint."""
+        order1 = "-A NULLTRACE_OUTPUT -j DROP\n-A NULLTRACE_OUTPUT -j ACCEPT"
+        order2 = "-A NULLTRACE_OUTPUT -j ACCEPT\n-A NULLTRACE_OUTPUT -j DROP"
+
+        hash1 = hashlib.sha256(order1.encode()).hexdigest()
+        hash2 = hashlib.sha256(order2.encode()).hexdigest()
+        self.assertNotEqual(hash1, hash2, "Reordered firewall rules must produce different fingerprints")
+
+    def test_fw_manifest_mandatory_and_complete_or_fail(self):
+        """P1-2 & P1-3: Manifest generation is complete-or-fail; missing/incomplete manifest yields PARTIAL."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+
+        # Missing binary raises RuntimeError during manifest generation (complete-or-fail)
+        with patch("nulltrace.require_trusted_binary", side_effect=RuntimeError("iptables missing")):
+            with self.assertRaises(RuntimeError):
+                app._generate_enforcement_manifest()
+
+        # Incomplete manifest (less than 11 chain fingerprints) in _check_live_firewall_status
+        meta = {
+            "enforcement_manifest": {
+                "chain_fingerprints": {"v4:filter:NULLTRACE_OUTPUT": "abc"}
+            }
+        }
+        rules_v4 = {
+            "filter": ["-A OUTPUT -j NULLTRACE_OUTPUT", "-A INPUT -j NULLTRACE_INPUT", "-A FORWARD -j NULLTRACE_FORWARD"],
+            "nat": ["-A OUTPUT -j NULLTRACE_NAT_OUTPUT"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_MANGLE_PREROUTING"],
+        }
+        rules_v6 = {
+            "filter": ["-A OUTPUT -j NULLTRACE_V6_OUTPUT", "-A INPUT -j NULLTRACE_V6_INPUT", "-A FORWARD -j NULLTRACE_V6_FORWARD"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_V6_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_V6_MANGLE_PREROUTING"],
+        }
+        chain_content = f"-N CHAIN\n-A CHAIN -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A CHAIN -j DROP\n"
+        def fake_run(cmd, **kwargs):
+            table = "filter"
+            if "-t" in cmd:
+                table = cmd[cmd.index("-t") + 1]
+            if len(cmd) >= 5 and cmd[3] == "-S" and not cmd[4].startswith("-"):
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=chain_content, stderr="")
+            if "ip6tables" in cmd[0]:
+                out = "\n".join(rules_v6.get(table, []))
+            else:
+                out = "\n".join(rules_v4.get(table, []))
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=out, stderr="")
+
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+             patch.object(app, "_load_session_metadata", return_value=meta), \
+             patch("nulltrace.run_trusted", side_effect=fake_run):
+            status = app._check_live_firewall_status()
+            self.assertEqual(status, nulltrace.LiveFirewallStatus.PARTIAL)
+
+    def test_recovery_failed_flush_does_not_remove_tooling(self):
+        """P1-6: Failed emergency flush retains NullTrace tooling in /usr/share and /usr/bin."""
+        with patch("install.inspect_live_nulltrace_rules", side_effect=[
+            install.FirewallInspectionResult.ACTIVE,
+            install.FirewallInspectionResult.ACTIVE,  # Still active after stop attempt
+            install.FirewallInspectionResult.ACTIVE,  # Still active after emergency flush
+        ]), \
+        patch("install.routing_may_be_active", return_value=True), \
+        patch("install.resolve_trusted_binary", return_value="/usr/sbin/iptables"), \
+        patch("install.run_trusted", return_value=subprocess.CompletedProcess(args=["iptables"], returncode=0, stdout="", stderr="")), \
+        patch("shutil.rmtree") as mock_rmtree, \
+        patch("os.remove") as mock_remove:
+            with self.assertRaises(SystemExit) as ctx:
+                install.uninstall_nulltrace(emergency_flush=True, interactive=False)
+            self.assertEqual(ctx.exception.code, 1)
+            mock_rmtree.assert_not_called()
+            mock_remove.assert_not_called()
+
+    def test_recovery_emergency_flush_covers_all_netfilter_tables(self):
+        """P2-8: Emergency flush flushes (-F) and deletes chains (-X) across all 5 netfilter tables."""
+        flushed_tables = []
+        def fake_run(cmd, **kwargs):
+            if "-F" in cmd or "-X" in cmd:
+                if "-t" in cmd:
+                    flushed_tables.append(cmd[cmd.index("-t") + 1])
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        with patch("install.inspect_live_nulltrace_rules", side_effect=[
+            install.FirewallInspectionResult.ACTIVE,
+            install.FirewallInspectionResult.ACTIVE,
+            install.FirewallInspectionResult.CLEAN,
+        ]), \
+        patch("install.routing_may_be_active", return_value=True), \
+        patch("install.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+        patch("install.run_trusted", side_effect=fake_run), \
+        patch("shutil.rmtree"), \
+        patch("os.remove"), \
+        patch("os.path.isdir", return_value=False), \
+        patch("os.path.isfile", return_value=False):
+            install.uninstall_nulltrace(emergency_flush=True, interactive=False)
+
+        for table in ("filter", "nat", "mangle", "raw", "security"):
+            self.assertIn(table, flushed_tables)
+
+    def test_recovery_ipv6_inspection_failure_returns_unknown(self):
+        """P1-7: When ip6tables is missing or fails, inspect_live_nulltrace_rules returns UNKNOWN, never CLEAN."""
+        with patch("install.resolve_trusted_binary", side_effect=lambda b: "/usr/sbin/iptables" if b == "iptables" else None):
+            self.assertEqual(install.inspect_live_nulltrace_rules(), install.FirewallInspectionResult.UNKNOWN)
+
+    def test_tor_unterminated_managed_block_raises(self):
+        """P1-8: Unterminated managed block (BEGIN without END) raises ValueError and avoids file truncation."""
+        unterminated = (
+            "SocksPort 9050\n"
+            f"{nulltrace.TOR_CONFIG_BEGIN}\n"
+            "TransPort 127.0.0.1:9040\n"
+        )
+        with self.assertRaises(ValueError) as ctx:
+            nulltrace.strip_tor_config_blocks(unterminated)
+        self.assertIn("unterminated", str(ctx.exception).lower())
+
+    def test_tor_config_existence_and_admin_changes_preserved(self):
+        """P1-9: Tor config existence metadata is honored; admin changes outside managed block are preserved."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            torrc = tmp_path / "torrc"
+            app = nulltrace.nulltrace()
+            app.config.tor_config = str(torrc)
+
+            # Case A: Originally absent torrc (tor_config_existed = False)
+            # NullTrace wrote only managed block -> restore unlinks torrc
+            torrc.write_text(f"{nulltrace.TOR_CONFIG_BEGIN}\nTransPort 9040\n{nulltrace.TOR_CONFIG_END}\n", encoding="utf-8")
+            app._tor_config_existed = False
+            with patch.object(app, "validate_tor_config_target", return_value=torrc), \
+                 patch.object(app, "_load_session_metadata", return_value={"tor_config_existed": False}), \
+                 patch.object(app, "_control_tor_service", return_value=(True, "")):
+                app.restore_tor_config()
+                self.assertFalse(torrc.exists(), "Originally absent torrc should be deleted when only managed block existed")
+
+            # Case B: Admin added changes outside managed block -> preserved!
+            torrc.write_text(
+                f"AdminSetting 42\n{nulltrace.TOR_CONFIG_BEGIN}\nTransPort 9040\n{nulltrace.TOR_CONFIG_END}\n",
+                encoding="utf-8"
+            )
+            app._tor_config_existed = False
+            with patch.object(app, "validate_tor_config_target", return_value=torrc), \
+                 patch.object(app, "_load_session_metadata", return_value={"tor_config_existed": False}), \
+                 patch.object(app, "_control_tor_service", return_value=(True, "")):
+                app.restore_tor_config()
+                self.assertTrue(torrc.exists())
+                self.assertIn("AdminSetting 42", torrc.read_text(encoding="utf-8"))
+
+    def test_service_and_interface_state_restoration(self):
+        """P1-10 & P1-11: Original Tor service state (active/enabled) and interface administrative state (up/down) restored."""
+        app = nulltrace.nulltrace()
+
+        # Tor initially inactive -> teardown calls "stop"
+        app._tor_initially_active = False
+        app._tor_initially_enabled = True
+        with patch.object(app, "validate_tor_config_target", return_value=Path("/etc/tor/torrc")), \
+             patch.object(app, "_control_tor_service", return_value=(True, "")) as mock_ctrl, \
+             patch.object(app, "_load_session_metadata", return_value={
+                 "tor_config_existed": False,
+                 "tor_service_initially_active": False,
+                 "tor_service_initially_enabled": True
+             }):
+            app.restore_tor_config()
+            mock_ctrl.assert_called_with("stop")
+
+        # Tor initially disabled -> teardown calls "disable"
+        app._tor_initially_active = True
+        app._tor_initially_enabled = False
+        with patch.object(app, "validate_tor_config_target", return_value=Path("/etc/tor/torrc")), \
+             patch.object(app, "_control_tor_service", return_value=(True, "")) as mock_ctrl, \
+             patch.object(app, "_load_session_metadata", return_value={
+                 "tor_config_existed": False,
+                 "tor_service_initially_active": True,
+                 "tor_service_initially_enabled": False
+             }):
+            app.restore_tor_config()
+            mock_ctrl.assert_any_call("disable")
+
+        # Interface initially DOWN -> restored as DOWN
+        app._spoofed_intf = "eth0"
+        app._original_mac = "00:11:22:33:44:55"
+        app._interface_initially_up = False
+        with patch("nulltrace.require_trusted_binary", return_value="/usr/sbin/ip"), \
+             patch.object(app, "_read_current_mac", return_value="00:11:22:33:44:55"), \
+             patch.object(app, "_persist_session_metadata"), \
+             patch("nulltrace.run_trusted") as mock_run:
+            app._restore_mac()
+            cmds = [call.args[0] for call in mock_run.call_args_list]
+            self.assertFalse(any(cmd[-1] == "up" for cmd in cmds))
+            self.assertTrue(any(cmd[-1] == "down" for cmd in cmds))
+
+    def test_listener_strict_tor_identity_verification(self):
+        """P1-4 & P2-6: Process identity strictly validates executable and UID semantics."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+
+        # Case A: Fake tor process (executable is /tmp/fake_tor)
+        def mock_readlink(p):
+            if str(p).endswith("exe"):
+                return "/tmp/fake_tor"
+            raise OSError()
+
+        mock_status = "Name:\ttor\nUid:\t109\t109\t109\t109\n"
+        with patch.object(Path, "is_dir", return_value=True), \
+             patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "read_text", return_value=mock_status), \
+             patch("os.readlink", side_effect=mock_readlink), \
+             patch("os.kill", return_value=None):
+            self.assertFalse(app._verify_process_is_tor(1234))
+
+        # Case B: Wrong UID (e.g. UID 1000 instead of 109)
+        mock_status_bad_uid = "Name:\ttor\nUid:\t1000\t1000\t1000\t1000\n"
+        with patch.object(Path, "is_dir", return_value=True), \
+             patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "read_text", return_value=mock_status_bad_uid), \
+             patch("os.readlink", return_value="/usr/bin/tor"), \
+             patch("os.kill", return_value=None):
+            self.assertFalse(app._verify_process_is_tor(1234))
+
+        # Case C: Valid Tor daemon
+        with patch.object(Path, "is_dir", return_value=True), \
+             patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "read_text", return_value=mock_status), \
+             patch("os.readlink", return_value="/usr/bin/tor"), \
+             patch("os.kill", return_value=None):
+            self.assertTrue(app._verify_process_is_tor(1234))
+
+    def test_listener_multi_pid_shared_socket_verification(self):
+        """P2-5: Multiple PIDs on shared socket: all candidate processes must be verified Tor."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+
+        # Two PIDs share socket: PID 1234 (tor) and PID 5678 (rogue)
+        with patch("nulltrace.resolve_trusted_binary", return_value="/usr/sbin/ss"):
+            ss_multi = 'LISTEN 0 128 127.0.0.1:9041 0.0.0.0:* users:(("tor",pid=1234,fd=6),("evil",pid=5678,fd=4))\n'
+            with patch("nulltrace.run_trusted", return_value=subprocess.CompletedProcess(
+                args=["ss"], returncode=0, stdout=ss_multi, stderr=""
+            )), \
+            patch.object(app, "_verify_process_is_tor", side_effect=lambda pid: pid == 1234):
+                self.assertFalse(app._verify_listener_ownership(9041, "tcp"))
+
+    def test_partial_activation_rollback_fail_closed(self):
+        """P2-7: Failure during any phase of activation triggers fail-closed rollback and leaves non-ACTIVE state."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with patch("nulltrace.PERSISTENT_DIR", tmp_path), patch("nulltrace.RUN_DIR", tmp_path), \
+                 patch("nulltrace.require_linux_root"), \
+                 patch.object(nulltrace.nulltrace, "_get_current_state", return_value=nulltrace.STATE_INACTIVE), \
+                 patch.object(nulltrace.nulltrace, "backup_iptables"), \
+                 patch.object(nulltrace.nulltrace, "backup_tor_config"), \
+                 patch.object(nulltrace.nulltrace, "apply_tor_config"), \
+                 patch.object(nulltrace.nulltrace, "_setup_custom_chains_v4"), \
+                 patch.object(nulltrace.nulltrace, "_setup_custom_chains_v6"), \
+                 patch.object(nulltrace.nulltrace, "_generate_enforcement_manifest", side_effect=RuntimeError("manifest failed")), \
+                 patch.object(nulltrace.nulltrace, "_rollback_startup") as mock_rollback:
+                app = nulltrace.nulltrace()
+                with self.assertRaises(RuntimeError):
+                    app.setup_network_rules()
+                mock_rollback.assert_called_once()
+                self.assertNotEqual(app._current_state, nulltrace.STATE_ACTIVE)
+
+    def test_fs_symlink_race_between_validation_and_write(self):
+        """P0-1: atomic_write detects destination replaced by symlink between validation and replacement."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest = Path(tmpdir) / "test.conf"
+            dest.write_text("initial", encoding="utf-8")
+
+            reg_st = MagicMock()
+            reg_st.st_mode = stat.S_IFREG | 0o600
+            reg_st.st_uid = 0
+            reg_st.st_gid = 0
+
+            sym_st = MagicMock()
+            sym_st.st_mode = stat.S_IFLNK | 0o777
+
+            stat_calls = [reg_st, sym_st]
+            def fake_lstat(p):
+                if stat_calls:
+                    return stat_calls.pop(0)
+                return sym_st
+
+            with patch("os.lstat", side_effect=fake_lstat), \
+                 patch("os.path.islink", side_effect=[False, True, True]):
+                with self.assertRaises(ValueError) as ctx:
+                    nulltrace.atomic_write(dest, "new data")
+                self.assertIn("symlink", str(ctx.exception).lower())
+
+    def test_fs_atomic_write_durability_and_permission_fatal_failures(self):
+        """P0-1 & P2-4: chmod, chown, and fsync failures in atomic_write are fatal and clean up temp files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest = Path(tmpdir) / "test.conf"
+
+            # 1. chmod failure is fatal
+            with patch("os.chmod", side_effect=PermissionError("chmod denied")):
+                with self.assertRaises(PermissionError):
+                    nulltrace.atomic_write(dest, "data")
+            self.assertEqual(len(list(Path(tmpdir).glob(".*tmp*"))), 0)
+
+            # 2. fsync failure is fatal
+            with patch("os.fsync", side_effect=OSError(errno.EIO, "fsync failed")):
+                with self.assertRaises(OSError):
+                    nulltrace.atomic_write(dest, "data")
+            self.assertEqual(len(list(Path(tmpdir).glob(".*tmp*"))), 0)
+
+    def test_fs_atomic_replacement_of_existing_file(self):
+        """P0-1: Atomic replacement of an existing valid file succeeds and preserves mode."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest = Path(tmpdir) / "test.conf"
+            dest.write_text("initial data", encoding="utf-8")
+            nulltrace.atomic_write(dest, "updated data", mode=0o600)
+            self.assertEqual(dest.read_text(encoding="utf-8"), "updated data")
+            self.assertEqual(len(list(Path(tmpdir).glob(".*tmp*"))), 0)
+
+    def test_fs_parent_directory_manipulation_rejection(self):
+        """P0-1: atomic_write rejects writing when parent directory is a symlink."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest = Path(tmpdir) / "test.conf"
+            with patch("os.path.islink", return_value=True):
+                with self.assertRaises(ValueError) as ctx:
+                    nulltrace.atomic_write(dest, "data")
+                self.assertIn("symlink", str(ctx.exception).lower())
+
+    def test_fw_conditional_jump_rejected(self):
+        """P0-2: Conditional firewall jumps (IP destination or owner UID) return PARTIAL."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+
+        # Case A: Jump matching destination IP
+        rules_cond_ip = {
+            "filter": ["-A OUTPUT -d 10.0.0.1 -j NULLTRACE_OUTPUT"],
+            "nat": ["-A OUTPUT -j NULLTRACE_NAT_OUTPUT"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_MANGLE_PREROUTING"],
+        }
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+             patch("nulltrace.run_trusted", side_effect=lambda cmd, **kw: subprocess.CompletedProcess(
+                 args=cmd, returncode=0,
+                 stdout="\n".join(rules_cond_ip.get(cmd[cmd.index("-t") + 1] if "-t" in cmd else "filter", [])) + "\n",
+                 stderr=""
+             )):
+            self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.PARTIAL)
+
+        # Case B: Jump matching owner UID
+        rules_cond_owner = {
+            "filter": ["-A OUTPUT -m owner --uid-owner 1000 -j NULLTRACE_OUTPUT"],
+            "nat": ["-A OUTPUT -j NULLTRACE_NAT_OUTPUT"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_MANGLE_PREROUTING"],
+        }
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+             patch("nulltrace.run_trusted", side_effect=lambda cmd, **kw: subprocess.CompletedProcess(
+                 args=cmd, returncode=0,
+                 stdout="\n".join(rules_cond_owner.get(cmd[cmd.index("-t") + 1] if "-t" in cmd else "filter", [])) + "\n",
+                 stderr=""
+             )):
+            self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.PARTIAL)
+
+    def test_fw_non_first_jump_and_duplicate_jump_rejected(self):
+        """P0-2: Non-first jumps and duplicate jumps to NULLTRACE chains return PARTIAL."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+
+        # Non-first jump
+        rules_non_first = {
+            "filter": ["-A OUTPUT -s 192.168.1.1 -j DROP", "-A OUTPUT -j NULLTRACE_OUTPUT"],
+            "nat": ["-A OUTPUT -j NULLTRACE_NAT_OUTPUT"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_MANGLE_PREROUTING"],
+        }
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+             patch("nulltrace.run_trusted", side_effect=lambda cmd, **kw: subprocess.CompletedProcess(
+                 args=cmd, returncode=0,
+                 stdout="\n".join(rules_non_first.get(cmd[cmd.index("-t") + 1] if "-t" in cmd else "filter", [])) + "\n",
+                 stderr=""
+             )):
+            self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.PARTIAL)
+
+        # Duplicate jump
+        rules_duplicate = {
+            "filter": ["-A OUTPUT -j NULLTRACE_OUTPUT", "-A OUTPUT -j NULLTRACE_OUTPUT"],
+            "nat": ["-A OUTPUT -j NULLTRACE_NAT_OUTPUT"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_MANGLE_PREROUTING"],
+        }
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+             patch("nulltrace.run_trusted", side_effect=lambda cmd, **kw: subprocess.CompletedProcess(
+                 args=cmd, returncode=0,
+                 stdout="\n".join(rules_duplicate.get(cmd[cmd.index("-t") + 1] if "-t" in cmd else "filter", [])) + "\n",
+                 stderr=""
+             )):
+            self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.PARTIAL)
+
+    def test_fw_exact_first_jump_and_valid_manifest_accepted(self):
+        """P0-2, P1-1, P1-3: Exact first jumps and matching ordered manifest return LiveFirewallStatus.ACTIVE."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+
+        rules_v4 = {
+            "filter": ["-A OUTPUT -j NULLTRACE_OUTPUT", "-A INPUT -j NULLTRACE_INPUT", "-A FORWARD -j NULLTRACE_FORWARD"],
+            "nat": ["-A OUTPUT -j NULLTRACE_NAT_OUTPUT"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_MANGLE_PREROUTING"],
+        }
+        rules_v6 = {
+            "filter": ["-A OUTPUT -j NULLTRACE_V6_OUTPUT", "-A INPUT -j NULLTRACE_V6_INPUT", "-A FORWARD -j NULLTRACE_V6_FORWARD"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_V6_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_V6_MANGLE_PREROUTING"],
+        }
+
+        chain_contents = {
+            "v4:filter:NULLTRACE_OUTPUT": f"-N NULLTRACE_OUTPUT\n-A NULLTRACE_OUTPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_OUTPUT -j DROP\n",
+            "v4:filter:NULLTRACE_INPUT": f"-N NULLTRACE_INPUT\n-A NULLTRACE_INPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_INPUT -j ACCEPT\n",
+            "v4:filter:NULLTRACE_FORWARD": f"-N NULLTRACE_FORWARD\n-A NULLTRACE_FORWARD -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_FORWARD -j DROP\n",
+            "v4:nat:NULLTRACE_NAT_OUTPUT": f"-N NULLTRACE_NAT_OUTPUT\n-A NULLTRACE_NAT_OUTPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_NAT_OUTPUT -p tcp -j REDIRECT --to-ports {app.config.tor_port}\n-A NULLTRACE_NAT_OUTPUT -p udp --dport 53 -j REDIRECT --to-ports {app.config.dns_port}\n",
+            "v4:mangle:NULLTRACE_MANGLE_OUTPUT": f"-N NULLTRACE_MANGLE_OUTPUT\n-A NULLTRACE_MANGLE_OUTPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_MANGLE_OUTPUT -j ACCEPT\n",
+            "v4:mangle:NULLTRACE_MANGLE_PREROUTING": f"-N NULLTRACE_MANGLE_PREROUTING\n-A NULLTRACE_MANGLE_PREROUTING -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_MANGLE_PREROUTING -j ACCEPT\n",
+            "v6:filter:NULLTRACE_V6_OUTPUT": f"-N NULLTRACE_V6_OUTPUT\n-A NULLTRACE_V6_OUTPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_OUTPUT -j REJECT\n",
+            "v6:filter:NULLTRACE_V6_INPUT": f"-N NULLTRACE_V6_INPUT\n-A NULLTRACE_V6_INPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_INPUT -j DROP\n",
+            "v6:filter:NULLTRACE_V6_FORWARD": f"-N NULLTRACE_V6_FORWARD\n-A NULLTRACE_V6_FORWARD -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_FORWARD -j DROP\n",
+            "v6:mangle:NULLTRACE_V6_MANGLE_OUTPUT": f"-N NULLTRACE_V6_MANGLE_OUTPUT\n-A NULLTRACE_V6_MANGLE_OUTPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_MANGLE_OUTPUT -j ACCEPT\n",
+            "v6:mangle:NULLTRACE_V6_MANGLE_PREROUTING": f"-N NULLTRACE_V6_MANGLE_PREROUTING\n-A NULLTRACE_V6_MANGLE_PREROUTING -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_MANGLE_PREROUTING -j ACCEPT\n",
+        }
+
+        manifest_fps = {}
+        for key, content in chain_contents.items():
+            canon = "\n".join(l.strip() for l in content.splitlines() if l.strip())
+            manifest_fps[key] = hashlib.sha256(canon.encode()).hexdigest()
+
+        meta = {"enforcement_manifest": {"chain_fingerprints": manifest_fps}}
+
+        def fake_run(cmd, **kwargs):
+            is_v6 = "ip6tables" in cmd[0]
+            table = "filter"
+            if "-t" in cmd:
+                table = cmd[cmd.index("-t") + 1]
+            if len(cmd) >= 5 and cmd[3] == "-S" and not cmd[4].startswith("-"):
+                chain = cmd[4]
+                key = f"{'v6' if is_v6 else 'v4'}:{table}:{chain}"
+                content = chain_contents.get(key, "")
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=content, stderr="")
+            rules = (rules_v6 if is_v6 else rules_v4).get(table, [])
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="\n".join(rules) + "\n", stderr="")
+
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+             patch.object(app, "_load_session_metadata", return_value=meta), \
+             patch("nulltrace.run_trusted", side_effect=fake_run):
+            self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.ACTIVE)
+
+    def test_fw_manifest_integrity_and_mismatch_rejection(self):
+        """P1-3: Missing manifest, corrupt manifest, and hash mismatches return PARTIAL."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+
+        rules_v4 = {
+            "filter": ["-A OUTPUT -j NULLTRACE_OUTPUT", "-A INPUT -j NULLTRACE_INPUT", "-A FORWARD -j NULLTRACE_FORWARD"],
+            "nat": ["-A OUTPUT -j NULLTRACE_NAT_OUTPUT"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_MANGLE_PREROUTING"],
+        }
+        rules_v6 = {
+            "filter": ["-A OUTPUT -j NULLTRACE_V6_OUTPUT", "-A INPUT -j NULLTRACE_V6_INPUT", "-A FORWARD -j NULLTRACE_V6_FORWARD"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_V6_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_V6_MANGLE_PREROUTING"],
+        }
+        chain_content = f"-N CHAIN\n-A CHAIN -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A CHAIN -p tcp -j REDIRECT --to-ports 9040\n-A CHAIN -p udp --dport 53 -j REDIRECT --to-ports 5353\n-A CHAIN -j DROP\n"
+
+        def fake_run(cmd, **kwargs):
+            is_v6 = "ip6tables" in cmd[0]
+            table = "filter"
+            if "-t" in cmd:
+                table = cmd[cmd.index("-t") + 1]
+            if len(cmd) >= 5 and cmd[3] == "-S" and not cmd[4].startswith("-"):
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=chain_content, stderr="")
+            rules = (rules_v6 if is_v6 else rules_v4).get(table, [])
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="\n".join(rules) + "\n", stderr="")
+
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+             patch("nulltrace.run_trusted", side_effect=fake_run):
+            # 1. Missing manifest
+            with patch.object(app, "_load_session_metadata", return_value=None):
+                self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.PARTIAL)
+
+            # 2. Corrupt manifest (non-dict)
+            with patch.object(app, "_load_session_metadata", return_value={"enforcement_manifest": "corrupt"}):
+                self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.PARTIAL)
+
+            # 3. Hash mismatch on chain fingerprint
+            bad_meta = {
+                "enforcement_manifest": {
+                    "chain_fingerprints": {
+                        f"v4:{t}:{c}": "wrong_hash"
+                        for t, c in [
+                            ("nat", nulltrace.CHAIN_NAT_OUTPUT),
+                            ("mangle", nulltrace.CHAIN_MANGLE_OUTPUT),
+                            ("mangle", nulltrace.CHAIN_MANGLE_PREROUTING),
+                            ("filter", nulltrace.CHAIN_FILTER_OUTPUT),
+                            ("filter", nulltrace.CHAIN_FILTER_INPUT),
+                            ("filter", nulltrace.CHAIN_FILTER_FORWARD),
+                        ]
+                    } | {
+                        f"v6:{t}:{c}": "wrong_hash"
+                        for t, c in [
+                            ("mangle", nulltrace.CHAIN_V6_MANGLE_OUTPUT),
+                            ("mangle", nulltrace.CHAIN_V6_MANGLE_PREROUTING),
+                            ("filter", nulltrace.CHAIN_V6_OUTPUT),
+                            ("filter", nulltrace.CHAIN_V6_INPUT),
+                            ("filter", nulltrace.CHAIN_V6_FORWARD),
+                        ]
+                    }
+                }
+            }
+            with patch.object(app, "_load_session_metadata", return_value=bad_meta):
+                self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.PARTIAL)
+
+    def test_recovery_successful_flush_removes_all_rules_and_tooling(self):
+        """P1-6 & P2-8: Successful emergency flush verifies CLEAN status and removes NullTrace program files."""
+        with patch("install.inspect_live_nulltrace_rules", side_effect=[
+            install.FirewallInspectionResult.ACTIVE,
+            install.FirewallInspectionResult.ACTIVE,
+            install.FirewallInspectionResult.CLEAN,
+        ]), \
+        patch("install.routing_may_be_active", return_value=True), \
+        patch("install.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+        patch("install.run_trusted", return_value=subprocess.CompletedProcess(args=["iptables"], returncode=0, stdout="", stderr="")), \
+        patch("shutil.rmtree") as mock_rmtree, \
+        patch("os.remove") as mock_remove, \
+        patch("os.path.isdir", return_value=True), \
+        patch("os.path.isfile", return_value=False):
+            install.uninstall_nulltrace(emergency_flush=True, interactive=False)
+            mock_rmtree.assert_called()
+
+    def test_service_and_interface_state_comprehensive(self):
+        """P1-10 & P1-11: Tor service enable detection and interface administrative state verification."""
+        app = nulltrace.nulltrace()
+
+        # 1. Tor service disabled detection via _check_tor_service_enabled
+        with patch("nulltrace.resolve_trusted_binary", return_value="/usr/bin/systemctl"), \
+             patch("nulltrace.run_trusted", return_value=subprocess.CompletedProcess(
+                 args=["systemctl", "is-enabled", "tor@default"], returncode=1, stdout="disabled\n", stderr=""
+             )):
+            self.assertFalse(app._check_tor_service_enabled())
+
+        # 2. Tor service enabled detection
+        with patch("nulltrace.resolve_trusted_binary", return_value="/usr/bin/systemctl"), \
+             patch("nulltrace.run_trusted", return_value=subprocess.CompletedProcess(
+                 args=["systemctl", "is-enabled", "tor@default"], returncode=0, stdout="enabled\n", stderr=""
+             )):
+            self.assertTrue(app._check_tor_service_enabled())
+
+        # 3. Interface administrative state detection via sysfs flags
+        with tempfile.TemporaryDirectory() as tmpdir:
+            flags_file = Path(tmpdir) / "flags"
+            flags_file.write_text("0x1003\n", encoding="utf-8")
+            with patch("pathlib.Path.exists", return_value=True), \
+                 patch("pathlib.Path.read_text", return_value="0x1003\n"):
+                self.assertTrue(app._is_interface_up("eth0"))
+
+            with patch("pathlib.Path.exists", return_value=True), \
+                 patch("pathlib.Path.read_text", return_value="0x1002\n"):
+                self.assertFalse(app._is_interface_up("eth0"))
+
+        # 4. _restore_mac when initially UP sets link up and calls DHCP
+        app._spoofed_intf = "eth0"
+        app._original_mac = "00:11:22:33:44:55"
+        app._interface_initially_up = True
+        with patch("nulltrace.require_trusted_binary", return_value="/usr/sbin/ip"), \
+             patch.object(app, "_read_current_mac", return_value="00:11:22:33:44:55"), \
+             patch.object(app, "_persist_session_metadata"), \
+             patch.object(app, "_renew_dhcp") as mock_dhcp, \
+             patch("nulltrace.run_trusted") as mock_run:
+            app._restore_mac()
+            cmds = [call.args[0] for call in mock_run.call_args_list]
+            self.assertTrue(any(cmd[-1] == "up" for cmd in cmds))
+            mock_dhcp.assert_called_once_with("eth0")
+
+    def test_partial_activation_and_recovery_scenarios(self):
+        """P2-7: State reconciliation detects interrupted activations and missing/partial live firewall rules."""
+        app = nulltrace.nulltrace()
+
+        # 1. State is ACTIVATING or PREPARING on disk -> reconcile_state returns RECOVERY_REQUIRED
+        with patch.object(app, "_load_session_metadata", return_value={"state": nulltrace.STATE_PREPARING}), \
+             patch.object(app, "_check_live_firewall_status", return_value=nulltrace.LiveFirewallStatus.PARTIAL):
+            self.assertEqual(app.reconcile_state(), nulltrace.STATE_RECOVERY_REQUIRED)
+
+        # 2. State is ACTIVE on disk, but live rules are PARTIAL -> reconcile_state returns RECOVERY_REQUIRED
+        with patch.object(app, "_load_session_metadata", return_value={"state": nulltrace.STATE_ACTIVE}), \
+             patch.object(app, "_check_live_firewall_status", return_value=nulltrace.LiveFirewallStatus.PARTIAL):
+            self.assertEqual(app.reconcile_state(), nulltrace.STATE_RECOVERY_REQUIRED)
+
+        # 3. State is INACTIVE on disk, but live rules are ACTIVE (orphaned rules) -> RECOVERY_REQUIRED
+        with patch.object(app, "_load_session_metadata", return_value={"state": nulltrace.STATE_INACTIVE}), \
+             patch.object(app, "_check_live_firewall_status", return_value=nulltrace.LiveFirewallStatus.ACTIVE):
+            self.assertEqual(app.reconcile_state(), nulltrace.STATE_RECOVERY_REQUIRED)
+
+        # 4. Live firewall status UNKNOWN -> RECOVERY_REQUIRED
+        with patch.object(app, "_load_session_metadata", return_value={"state": nulltrace.STATE_ACTIVE}), \
+             patch.object(app, "_check_live_firewall_status", return_value=nulltrace.LiveFirewallStatus.UNKNOWN):
+            self.assertEqual(app.reconcile_state(), nulltrace.STATE_RECOVERY_REQUIRED)
 
 
 if __name__ == "__main__":

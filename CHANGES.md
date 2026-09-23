@@ -348,4 +348,61 @@ This section details the final security overhaul addressing every ticket in `nul
 - **Remediation**:
   - Enforced regex `^[A-Za-z]{2}$` and normalized to uppercase, rejecting non-ASCII unicode lookalikes.
 
+---
 
+## Comprehensive Security & Correctness Hardening (P0, P1, P2 Specifications)
+
+### P0-1: Race-Resistant Privileged Configuration Writes (`atomic_write`)
+- **Remediation**: Reimplemented `atomic_write()` with fd-relative operations (`os.open` with `O_DIRECTORY | O_NOFOLLOW` on POSIX), pre-stat symlink race checks, directory validation, fatal error reporting on chmod/chown/fsync, and directory fsync.
+
+### P0-2: Exact Unconditional First-Rule Jump Verification
+- **Remediation**: In `_check_live_firewall_status()`, required exact rule 0 unconditional jump (`-A <BASE_CHAIN> -j <NULLTRACE_CHAIN>`). Rejected non-first jumps, preceding `ACCEPT` bypasses, duplicate jumps, and conditional jumps.
+
+### P1-1 & P1-2: Order-Preserving Complete-or-Fail Firewall Manifests
+- **Remediation**: Preserved exact kernel rule ordering in canonical representation (no sorting) for SHA-256 fingerprints. Made manifest generation complete-or-fail across all 11 required chains (6 IPv4, 5 IPv6), raising `RuntimeError` on any inspection failure.
+
+### P1-3: Mandatory Manifest Validation for ACTIVE Status
+- **Remediation**: `_check_live_firewall_status()` strictly requires a valid persisted manifest, complete set of 11 chain fingerprints, and matching hashes for `ACTIVE` status. Missing or corrupt manifests return `PARTIAL`.
+
+### P1-4 & P2-6: Strong Tor Process Identity & UID Validation
+- **Remediation**: Eliminated process-name trust from `pgrep` candidate discovery in `_control_tor_service()`. Enforced multi-point validation in `_verify_process_is_tor()`: verified alive PID, `/proc/<pid>/exe` pointing to trusted Tor binary, effective UID matching expected Tor UID, and real UID matching expected UID or root (privilege drop service).
+
+### P1-5: Hardened Trusted Binary Integrity
+- **Remediation**: `resolve_trusted_binary()` in `nulltrace.py` and `install.py` requires regular files (`stat.S_ISREG`), root ownership on POSIX, no group/world writable bits (`mode & 0o022 == 0`), and symlinks strictly resolving inside trusted system directories.
+
+### P1-6 & P2-8: Verified Emergency Teardown & All-Tables Flush
+- **Remediation**: In `install.py`, expanded `--emergency-flush-all-rules` to flush (`-F`) and delete chains (`-X`) across all 5 netfilter tables (`filter`, `nat`, `mangle`, `raw`, `security`) for both `iptables` and `ip6tables`. Added post-flush live firewall inspection requiring `CLEAN` state before removing `/usr/share/nulltrace` and `/usr/bin/nulltrace`.
+
+### P1-7: Tri-State Installer Firewall Inspection
+- **Remediation**: `inspect_live_nulltrace_rules()` requires successful inspection of both `iptables` and `ip6tables` across all netfilter tables. Inability to inspect IPv6 returns `UNKNOWN`, never false `CLEAN`.
+
+### P1-8: Unterminated Managed Tor Configuration Protection
+- **Remediation**: In `strip_tor_config_blocks()`, unterminated managed blocks (`BEGIN` without `END`) raise `ValueError`, preventing truncation of administrator settings.
+
+### P1-9: Original Tor Configuration Existence Tracking
+- **Remediation**: Persisted `tor_config_existed` boolean metadata. On teardown, if torrc originally did not exist and only the managed block was added, the file is unlinked; if an administrator added settings, those are preserved.
+
+### P1-10 & P1-11: Original Service & Interface State Restoration
+- **Remediation**: Captured `tor_service_initially_active` and `tor_service_initially_enabled` before changes; restored to initial active/enabled states during teardown. Captured `interface_initially_up`; restored both hardware MAC and administrative UP/DOWN state.
+
+### P2-1: Destructive Restore Safeguards
+- **Remediation**: Added prominent warnings to CLI help and runtime logs explaining that `--destructive-restore` is a last-resort recovery mechanism that can overwrite host firewall rules modified after activation.
+
+### P2-2: Runtime & Persistent Directory Security Validation
+- **Remediation**: Implemented `_validate_secure_directory()` checking directory existence, regular directory type, not a symlink, root ownership, and restrictive non-writable permissions.
+
+### P2-3: Strict Session ID Format Validation
+- **Remediation**: Implemented `is_valid_session_id()` strictly enforcing lowercase hex 8-16 characters (`^[0-9a-f]{8,16}$`), rejecting directory traversal, special characters, and path separators.
+
+### P2-5: Multi-PID Shared Socket Ownership
+- **Remediation**: In `_find_pids_by_socket_inode()` and `_verify_listener_ownership()`, enumerated all processes sharing a socket (e.g. `SO_REUSEPORT`) and verified that every candidate PID is an authentic Tor daemon.
+
+### P2-7: Durable Multi-Phase Activation Model
+- **Remediation**: Modeled activation as a durable multi-phase process with intermediate checkpoints, pre-change state persistence, and fail-closed automatic rollback upon interruption.
+
+### Final Verification & Edge-Case Hardening
+- **`_check_tor_service_enabled()`**: Corrected return logic so that disabled systemd services (`systemctl is-enabled` returning non-zero/disabled) evaluate strictly to `False` rather than mistakenly defaulting to `True`, ensuring Tor is properly disabled on teardown when initially disabled.
+- **`_is_interface_up()`**: Added direct kernel administrative state detection reading `/sys/class/net/<intf>/flags` bit 0 (`IFF_UP`), providing unambiguous administrative state detection independent of operational carrier status.
+- **`atomic_write()`**: Added open file descriptor permissions setting (`fchmod`/`fchown` on `tf.fileno()`), parent directory symlink rejection in fallback mode, and pre-replacement symlink validation in fallback mode.
+- **`resolve_trusted_binary()`**: Validated root ownership on both the symlink itself and resolved target on POSIX systems.
+- **Regression Suite (Section 11)**: Expanded `TestSection11_ComprehensiveRegressions` with 11 additional unit tests, achieving 130 passing tests (100% pass rate) covering every bullet point in the specification document.

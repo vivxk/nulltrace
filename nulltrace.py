@@ -132,25 +132,82 @@ TRUSTED_BIN_DIRS = ("/usr/sbin", "/usr/bin", "/sbin", "/bin")
 
 def resolve_trusted_binary(name: str) -> Optional[str]:
     """
-    Resolve an executable strictly to a trusted system directory (NT-006).
-    Rejects relative lookups through user-controlled PATH and path traversal attempts.
+    Resolve an executable strictly to a trusted system directory (NT-006, P1-5).
+    Rejects relative lookups, path traversals, non-root-owned binaries,
+    group/world-writable binaries, non-regular files, and symlinks resolving
+    outside approved trusted directories.
     """
     if not name or not isinstance(name, str):
         return None
     p = Path(name)
+    candidates: List[Path] = []
     if p.is_absolute():
         p_str = p.as_posix()
         for tdir in TRUSTED_BIN_DIRS:
-            if p_str == f"{tdir}/{p.name}" and p.is_file() and os.access(p_str, os.X_OK):
-                return p_str
-        return None
-    # If not an absolute path, must be a pure filename without path separators or traversal
-    if p.name != name or "/" in name or "\\" in name or ".." in name:
-        return None
-    for directory in TRUSTED_BIN_DIRS:
-        candidate = Path(directory) / name
-        if candidate.is_file() and os.access(str(candidate), os.X_OK):
-            return str(candidate)
+            if p_str == f"{tdir}/{p.name}":
+                candidates.append(p)
+                break
+        if not candidates:
+            return None
+    else:
+        # If not an absolute path, must be a pure filename without path separators or traversal
+        if p.name != name or "/" in name or "\\" in name or ".." in name:
+            return None
+        for directory in TRUSTED_BIN_DIRS:
+            candidates.append(Path(directory) / name)
+
+    for candidate in candidates:
+        if not (candidate.exists() or os.path.islink(str(candidate))):
+            continue
+        try:
+            lst = os.lstat(str(candidate))
+        except OSError:
+            continue
+
+        # Reject if symlink points outside trusted directories
+        if stat.S_ISLNK(lst.st_mode):
+            if hasattr(lst, "st_uid") and (os.name != "nt" or getattr(os, "_force_posix_security_checks", False)):
+                if lst.st_uid != 0:
+                    continue
+            try:
+                target = candidate.resolve()
+            except OSError:
+                continue
+            target_str = target.as_posix()
+            target_in_trusted = any(
+                target_str == f"{tdir}/{target.name}" or target_str.startswith(f"{tdir}/")
+                for tdir in TRUSTED_BIN_DIRS
+            )
+            if not target_in_trusted:
+                continue
+            try:
+                target_st = os.stat(str(target))
+            except OSError:
+                continue
+        else:
+            if not stat.S_ISREG(lst.st_mode):
+                continue
+            target_st = lst
+
+        # Must be a regular file
+        if not stat.S_ISREG(target_st.st_mode):
+            continue
+
+        # Must be executable
+        if not os.access(str(candidate), os.X_OK):
+            continue
+
+        # Must NOT be group-writable or world-writable (P1-5)
+        if target_st.st_mode & 0o022:
+            continue
+
+        # Must be root-owned on POSIX systems (P1-5)
+        if hasattr(target_st, "st_uid") and os.name != "nt":
+            if target_st.st_uid != 0:
+                continue
+
+        return candidate.as_posix()
+
     return None
 
 
@@ -244,102 +301,192 @@ def atomic_write(
     gid: Optional[int] = None,
 ) -> None:
     """
-    Atomically write content to path using temporary file, fsync, and replace (NT-015, P1.1, P2.6).
-    Preserves original file permissions and ownership; never widens permissions.
-    New files default to restrictive 0o600 permissions.
-    Rejects writing to symlinks or non-regular files (FIFOs, sockets, devices).
+    Race-resistant atomic durable write to path (P0-1, P2-4, NT-015, P1.1).
+    Validates parent directory security using file descriptors.
+    Uses O_DIRECTORY | O_NOFOLLOW to open parent directory and validate permissions.
+    Performs creation, permissions, fsync, and replace relative to the parent directory.
+    Treats security/durability failures (chmod, chown, fsync) as fatal.
+    Rejects writing to symlinks, non-regular files, or insecure directories.
     """
-    path_obj = Path(path)
-    if path_obj.exists() or os.path.islink(str(path_obj)):
-        try:
-            lst = os.lstat(str(path_obj))
-            if stat.S_ISLNK(lst.st_mode):
+    dest_path = Path(path)
+    dest_name = dest_path.name
+    if not dest_name or dest_name in (".", ".."):
+        raise ValueError(f"Invalid destination filename '{path}'")
+
+    parent_path = dest_path.parent
+    parent_path.mkdir(parents=True, exist_ok=True)
+
+    dir_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        dir_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        dir_flags |= os.O_NOFOLLOW
+
+    dir_fd: Optional[int] = None
+    try:
+        if os.name != "nt":
+            try:
+                dir_fd = os.open(str(parent_path), dir_flags)
+            except OSError as exc:
+                raise ValueError(f"Failed to open parent directory '{parent_path}' securely: {exc}") from exc
+
+        if dir_fd is not None:
+            st_dir = os.fstat(dir_fd)
+        else:
+            if os.path.islink(str(parent_path)):
+                raise ValueError(f"Parent '{parent_path}' is a symlink; refusing privileged write.")
+            st_dir = os.stat(str(parent_path))
+
+        if not stat.S_ISDIR(st_dir.st_mode):
+            raise ValueError(f"Parent '{parent_path}' is not a directory.")
+
+        # POSIX security checks for parent directory
+        if os.name != "nt" or getattr(os, "_force_posix_security_checks", False):
+            if st_dir.st_mode & 0o002:
+                raise ValueError(f"Directory '{parent_path}' is world-writable; refusing privileged write.")
+            if (st_dir.st_mode & 0o020) and hasattr(os, "geteuid") and os.geteuid() == 0:
+                if st_dir.st_gid != 0:
+                    raise ValueError(f"Directory '{parent_path}' is group-writable by non-root group ({st_dir.st_gid}); refusing privileged write.")
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                if st_dir.st_uid != 0 and (uid is None or st_dir.st_uid != uid):
+                    raise ValueError(f"Directory '{parent_path}' is not owned by root or target uid (owner: {st_dir.st_uid}); refusing privileged write.")
+
+        orig_stat = None
+        has_dir_fd_stat = dir_fd is not None and hasattr(os, "stat") and os.stat in getattr(os, "supports_dir_fd", set())
+        if has_dir_fd_stat:
+            try:
+                orig_stat = os.stat(dest_name, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                orig_stat = None
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    orig_stat = None
+                else:
+                    raise
+        else:
+            full_dest = parent_path / dest_name
+            if full_dest.exists() or os.path.islink(str(full_dest)):
+                orig_stat = os.lstat(str(full_dest))
+
+        if orig_stat is not None:
+            if stat.S_ISLNK(orig_stat.st_mode):
                 raise ValueError(f"Destination '{path}' is a symlink; refusing privileged write.")
-            if not stat.S_ISREG(lst.st_mode):
+            if not stat.S_ISREG(orig_stat.st_mode):
                 raise ValueError(f"Destination '{path}' is not a regular file; refusing write.")
-        except OSError as exc:
-            if getattr(exc, "errno", None) != errno.ENOENT:
-                raise
 
-    dest = Path(path).resolve()
-    dest.parent.mkdir(parents=True, exist_ok=True)
+        target_uid = uid if uid is not None else (orig_stat.st_uid if orig_stat else None)
+        target_gid = gid if gid is not None else (orig_stat.st_gid if orig_stat else None)
 
-    # Preserve ownership and permissions of existing file if present (P1.1)
-    orig_stat = None
-    try:
-        if dest.exists():
-            orig_stat = dest.stat()
-    except OSError:
-        pass
+        if orig_stat is not None:
+            target_mode = orig_stat.st_mode & 0o777
+            if mode is not None:
+                # Allow tightening permissions, never widening
+                target_mode = target_mode & mode
+        elif mode is not None:
+            target_mode = mode
+        else:
+            target_mode = 0o600
 
-    target_uid = uid if uid is not None else (orig_stat.st_uid if orig_stat else None)
-    target_gid = gid if gid is not None else (orig_stat.st_gid if orig_stat else None)
+        is_text = isinstance(content, str)
+        prefix = f".{dest_name}.tmp_"
 
-    if orig_stat is not None:
-        target_mode = orig_stat.st_mode & 0o777
-        if mode is not None:
-            # Allow tightening permissions, never widening
-            target_mode = target_mode & mode
-    elif mode is not None:
-        target_mode = mode
-    else:
-        target_mode = 0o600
-
-    is_text = isinstance(content, str)
-    prefix = f".{dest.name}.tmp_"
-
-    tf = tempfile.NamedTemporaryFile(
-        mode="w" if is_text else "wb",
-        dir=dest.parent,
-        prefix=prefix,
-        delete=False,
-        encoding="utf-8" if is_text else None,
-    )
-    temp_path = Path(tf.name)
-    try:
+        tf = tempfile.NamedTemporaryFile(
+            mode="w" if is_text else "wb",
+            dir=parent_path,
+            prefix=prefix,
+            delete=False,
+            encoding="utf-8" if is_text else None,
+        )
+        temp_path = Path(tf.name)
         try:
-            tf.write(content)
-            tf.flush()
-            os.fsync(tf.fileno())
-        finally:
-            tf.close()
-    except Exception:
-        try:
-            temp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
-
-    try:
-        try:
-            os.chmod(temp_path, target_mode)
-        except OSError:
-            pass
-        if target_uid is not None or target_gid is not None:
             try:
-                os.chown(
-                    temp_path,
-                    target_uid if target_uid is not None else -1,
-                    target_gid if target_gid is not None else -1,
-                )
-            except (OSError, AttributeError):
-                pass
-        os.replace(temp_path, dest)
-        if hasattr(os, "O_DIRECTORY") and hasattr(os, "fsync"):
+                tf.write(content)
+                tf.flush()
+                os.fsync(tf.fileno())
+                # Race-free permission & ownership setting via open fd
+                if hasattr(os, "fchmod"):
+                    os.fchmod(tf.fileno(), target_mode)
+                if (target_uid is not None or target_gid is not None) and hasattr(os, "fchown"):
+                    if hasattr(os, "geteuid") and os.geteuid() == 0 and (os.name != "nt" or getattr(os, "_force_posix_security_checks", False)):
+                        os.fchown(
+                            tf.fileno(),
+                            target_uid if target_uid is not None else -1,
+                            target_gid if target_gid is not None else -1,
+                        )
+            finally:
+                tf.close()
+        except Exception:
             try:
-                dir_fd = os.open(str(dest.parent), os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
+                temp_path.unlink(missing_ok=True)
             except OSError:
                 pass
-    except Exception:
+            raise
+
         try:
-            temp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+            # Fallback chmod - fatal on failure (P2-4)
+            if not hasattr(os, "fchmod"):
+                os.chmod(temp_path, target_mode)
+
+            # Fallback ownership if requested - fatal on failure (P2-4)
+            if (target_uid is not None or target_gid is not None) and not hasattr(os, "fchown"):
+                if hasattr(os, "chown") and hasattr(os, "geteuid") and os.geteuid() == 0 and (os.name != "nt" or getattr(os, "_force_posix_security_checks", False)):
+                    os.chown(
+                        temp_path,
+                        target_uid if target_uid is not None else -1,
+                        target_gid if target_gid is not None else -1,
+                    )
+
+            # Re-check destination in dir before replace to prevent race to symlink
+            if has_dir_fd_stat:
+                try:
+                    pre_stat = os.stat(dest_name, dir_fd=dir_fd, follow_symlinks=False)
+                    if stat.S_ISLNK(pre_stat.st_mode):
+                        raise ValueError(f"Destination '{path}' was replaced with a symlink; refusing write.")
+                    if not stat.S_ISREG(pre_stat.st_mode):
+                        raise ValueError(f"Destination '{path}' was replaced with a non-regular file; refusing write.")
+                except (FileNotFoundError, OSError) as exc:
+                    if getattr(exc, "errno", None) != errno.ENOENT:
+                        raise
+            else:
+                full_dest = parent_path / dest_name
+                try:
+                    pre_stat = os.lstat(str(full_dest))
+                    if stat.S_ISLNK(pre_stat.st_mode):
+                        raise ValueError(f"Destination '{path}' was replaced with a symlink; refusing write.")
+                    if not stat.S_ISREG(pre_stat.st_mode):
+                        raise ValueError(f"Destination '{path}' was replaced with a non-regular file; refusing write.")
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    if getattr(exc, "errno", None) != errno.ENOENT:
+                        raise
+
+            # Perform atomic replacement
+            has_dir_fd_replace = dir_fd is not None and hasattr(os, "replace") and os.replace in getattr(os, "supports_dir_fd", set())
+            if has_dir_fd_replace:
+                os.replace(temp_path.name, dest_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            else:
+                os.replace(temp_path, parent_path / dest_name)
+
+            # Directory fsync - treat fatal errors as fatal (P2-4)
+            if dir_fd is not None and hasattr(os, "fsync"):
+                try:
+                    os.fsync(dir_fd)
+                except OSError as exc:
+                    if exc.errno not in (errno.EINVAL, errno.EBADF, errno.EOPNOTSUPP, errno.ENOTTY):
+                        raise
+        except Exception:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+    finally:
+        if dir_fd is not None:
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
 
 
 def get_config_home() -> Path:
@@ -378,7 +525,7 @@ MAC_RE = re.compile(r"^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
 
 
 def strip_tor_config_blocks(content: str) -> str:
-    """Remove nulltrace blocks from torrc text."""
+    """Remove nulltrace blocks from torrc text (NT-014, P1-8)."""
     lines = content.splitlines(keepends=True)
     filtered: List[str] = []
     skipping = False
@@ -398,6 +545,13 @@ def strip_tor_config_blocks(content: str) -> str:
         elif stripped == active_end:
             skipping = False
             active_end = None
+
+    if skipping:
+        raise ValueError(
+            "Unterminated NullTrace managed configuration block in torrc (missing END marker). "
+            "Refusing destructive rewrite."
+        )
+
     return "".join(filtered)
 
 
@@ -502,6 +656,19 @@ class NetworkConfig:
     exit_country: Optional[str] = None
 
 
+SESSION_ID_RE = re.compile(r"^[0-9a-f]{8,16}$")
+
+
+def is_valid_session_id(sid: Any) -> bool:
+    """Strictly validate session ID format (P2-3)."""
+    if not sid or not isinstance(sid, str):
+        return False
+    if "/" in sid or "\\" in sid or ".." in sid or "\0" in sid:
+        return False
+    # Standard format is 8-16 lowercase hex characters (P2-3)
+    return bool(SESSION_ID_RE.match(sid))
+
+
 class nulltrace:
     def __init__(self, circuit_time: int = 3600, verbose: bool = False):
         self.config = NetworkConfig()
@@ -523,12 +690,14 @@ class nulltrace:
         self.tor_config_content = self.generate_tor_config(self.circuit_time)
 
     def bind_session(self, session_id: str) -> None:
-        """Bind execution, backup lookup, and state operations to a specific persisted session (P0.1)."""
+        """Bind execution, backup lookup, and state operations to a specific persisted session (P0.1, P2-3)."""
+        if not is_valid_session_id(session_id):
+            raise ValueError(f"Invalid session ID format: '{session_id}'. Must be a valid session identifier.")
         self._session_id = session_id
 
     def _discover_session_id(self) -> Optional[str]:
         """
-        Discover active or uncleaned recoverable session ID from persistent state or session directory (P0.1, P1.2).
+        Discover active or uncleaned recoverable session ID from persistent state or session directory (P0.1, P1.2, P2-3).
         Only sessions in RECOVERABLE_STATES are considered.
         Historical INACTIVE sessions are never selected for recovery.
         """
@@ -539,7 +708,7 @@ class nulltrace:
                     data = json.loads(sf.read_text(encoding="utf-8"))
                     sid = data.get("session_id")
                     st = data.get("state")
-                    if sid and (st in RECOVERABLE_STATES or data.get("active")):
+                    if sid and is_valid_session_id(sid) and (st in RECOVERABLE_STATES or data.get("active")):
                         if (PERSISTENT_DIR / f"session_{sid}").exists() or sf == (PERSISTENT_DIR / "state.json"):
                             return sid
                 except (OSError, json.JSONDecodeError):
@@ -567,6 +736,10 @@ class nulltrace:
                             created_str = mdata.get("created_at", "")
                             mtime = c.stat().st_mtime if c.exists() else 0
                             sid = c.name.replace("session_", "")
+                            if not is_valid_session_id(sid):
+                                continue
+                            if c.name != f"session_{sid}":
+                                continue
                             parsed_candidates.append((prio, created_str, mtime, sid))
                     except (OSError, json.JSONDecodeError):
                         pass
@@ -815,14 +988,66 @@ class nulltrace:
         config_block += f"{TOR_CONFIG_END}\n"
         return config_block
 
+    @staticmethod
+    def _validate_secure_directory(d: Path) -> None:
+        """
+        Validate runtime/persistent directory security (P2-2):
+        - must exist and be a directory
+        - not a symlink
+        - root-owned (when running as root)
+        - no group or world write permissions
+        - safe parent directory assumptions
+        """
+        if not d.exists() and not os.path.islink(str(d)):
+            d.mkdir(mode=0o700, parents=True, exist_ok=True)
+            try:
+                os.chmod(d, 0o700)
+            except OSError:
+                pass
+
+        lst = os.lstat(str(d))
+        if stat.S_ISLNK(lst.st_mode):
+            raise RuntimeError(f"Security violation: directory '{d}' is a symlink; refusing to use.")
+        if not stat.S_ISDIR(lst.st_mode):
+            raise RuntimeError(f"Security violation: '{d}' is not a directory; refusing to use.")
+
+        # POSIX security checks
+        if os.name != "nt" or getattr(os, "_force_posix_security_checks", False):
+            if lst.st_mode & 0o022:
+                try:
+                    os.chmod(d, lst.st_mode & ~0o022)
+                    lst = os.lstat(str(d))
+                except OSError:
+                    pass
+                if lst.st_mode & 0o022:
+                    raise RuntimeError(
+                        f"Security violation: directory '{d}' has insecure permissions ({oct(lst.st_mode)}); group or world writable."
+                    )
+
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                if lst.st_uid != 0:
+                    raise RuntimeError(
+                        f"Security violation: directory '{d}' is owned by UID {lst.st_uid}, expected root (UID 0)."
+                    )
+
+            # Validate parent directory
+            parent = d.parent
+            if parent.exists() or os.path.islink(str(parent)):
+                plst = os.lstat(str(parent))
+                if stat.S_ISLNK(plst.st_mode):
+                    raise RuntimeError(f"Security violation: parent directory '{parent}' is a symlink.")
+                if (plst.st_mode & 0o002) and not (plst.st_mode & stat.S_ISVTX):
+                    raise RuntimeError(
+                        f"Security violation: parent directory '{parent}' is world-writable without sticky bit."
+                    )
+                if hasattr(os, "geteuid") and os.geteuid() == 0 and plst.st_uid != 0:
+                    raise RuntimeError(
+                        f"Security violation: parent directory '{parent}' is not root-owned."
+                    )
+
     def _ensure_runtime_dirs(self) -> None:
-        RUN_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-        PERSISTENT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-        try:
-            os.chmod(RUN_DIR, 0o700)
-            os.chmod(PERSISTENT_DIR, 0o700)
-        except OSError:
-            pass
+        self._validate_secure_directory(RUN_DIR)
+        self._validate_secure_directory(PERSISTENT_DIR)
 
     def _acquire_lock(self) -> None:
         self._ensure_runtime_dirs()
@@ -853,7 +1078,13 @@ class nulltrace:
                     del self._lock_fd
 
     def _session_dir(self) -> Path:
-        return PERSISTENT_DIR / f"session_{self.session_id}"
+        sid = self.session_id
+        if not is_valid_session_id(sid):
+            raise ValueError(f"Security violation: invalid session ID '{sid}'. Refusing path construction.")
+        sdir = PERSISTENT_DIR / f"session_{sid}"
+        if sdir.name != f"session_{sid}":
+            raise ValueError(f"Session directory basename mismatch: '{sdir.name}' vs 'session_{sid}'")
+        return sdir
 
     def _load_session_metadata(self) -> Optional[Dict[str, Any]]:
         """Load session metadata and bind recovery session identity (P0.1)."""
@@ -890,11 +1121,13 @@ class nulltrace:
 
     def _generate_enforcement_manifest(self) -> Dict[str, Any]:
         """
-        Generate enforcement manifest for current session (P0.2).
+        Generate enforcement manifest for current session (P0.2, P1-1, P1-2).
         Records expected chains, jumps, and rule fingerprints for live integrity verification.
+        Complete-or-fail: all required v4 and v6 chains must be fingerprinted
+        preserving exact rule order.
         """
-        iptables_bin = resolve_trusted_binary("iptables")
-        ip6tables_bin = resolve_trusted_binary("ip6tables")
+        iptables_bin = require_trusted_binary("iptables")
+        ip6tables_bin = require_trusted_binary("ip6tables")
 
         manifest: Dict[str, Any] = {
             "version": "1.0",
@@ -919,42 +1152,51 @@ class nulltrace:
             "chain_fingerprints": {},
         }
 
-        # Compute fingerprints for all v4 chains
-        if iptables_bin:
-            table_chains_v4 = [
-                ("nat", CHAIN_NAT_OUTPUT),
-                ("mangle", CHAIN_MANGLE_OUTPUT),
-                ("mangle", CHAIN_MANGLE_PREROUTING),
-                ("filter", CHAIN_FILTER_OUTPUT),
-                ("filter", CHAIN_FILTER_INPUT),
-                ("filter", CHAIN_FILTER_FORWARD),
-            ]
-            for table, chain in table_chains_v4:
-                try:
-                    res = run_trusted([iptables_bin, "-t", table, "-S", chain], check=False)
-                    if res.returncode == 0:
-                        canon = "\n".join(sorted(l.strip() for l in res.stdout.splitlines() if l.strip()))
-                        manifest["chain_fingerprints"][f"v4:{table}:{chain}"] = hashlib.sha256(canon.encode()).hexdigest()
-                except Exception:
-                    pass
+        # Compute fingerprints for all v4 chains (order-preserving, complete-or-fail)
+        table_chains_v4 = [
+            ("nat", CHAIN_NAT_OUTPUT),
+            ("mangle", CHAIN_MANGLE_OUTPUT),
+            ("mangle", CHAIN_MANGLE_PREROUTING),
+            ("filter", CHAIN_FILTER_OUTPUT),
+            ("filter", CHAIN_FILTER_INPUT),
+            ("filter", CHAIN_FILTER_FORWARD),
+        ]
+        for table, chain in table_chains_v4:
+            res = run_trusted([iptables_bin, "-t", table, "-S", chain], check=False)
+            if res.returncode != 0:
+                raise RuntimeError(
+                    f"Manifest generation failed: could not inspect v4 chain {table}:{chain} "
+                    f"(code {res.returncode}): {res.stderr or res.stdout}"
+                )
+            # P1-1: Preserve exact rule order (no sorting)
+            canon = "\n".join(l.strip() for l in res.stdout.splitlines() if l.strip())
+            manifest["chain_fingerprints"][f"v4:{table}:{chain}"] = hashlib.sha256(canon.encode()).hexdigest()
 
-        # Compute fingerprints for all v6 chains
-        if ip6tables_bin:
-            table_chains_v6 = [
-                ("mangle", CHAIN_V6_MANGLE_OUTPUT),
-                ("mangle", CHAIN_V6_MANGLE_PREROUTING),
-                ("filter", CHAIN_V6_OUTPUT),
-                ("filter", CHAIN_V6_INPUT),
-                ("filter", CHAIN_V6_FORWARD),
-            ]
-            for table, chain in table_chains_v6:
-                try:
-                    res = run_trusted([ip6tables_bin, "-t", table, "-S", chain], check=False)
-                    if res.returncode == 0:
-                        canon = "\n".join(sorted(l.strip() for l in res.stdout.splitlines() if l.strip()))
-                        manifest["chain_fingerprints"][f"v6:{table}:{chain}"] = hashlib.sha256(canon.encode()).hexdigest()
-                except Exception:
-                    pass
+        # Compute fingerprints for all v6 chains (order-preserving, complete-or-fail)
+        table_chains_v6 = [
+            ("mangle", CHAIN_V6_MANGLE_OUTPUT),
+            ("mangle", CHAIN_V6_MANGLE_PREROUTING),
+            ("filter", CHAIN_V6_OUTPUT),
+            ("filter", CHAIN_V6_INPUT),
+            ("filter", CHAIN_V6_FORWARD),
+        ]
+        for table, chain in table_chains_v6:
+            res = run_trusted([ip6tables_bin, "-t", table, "-S", chain], check=False)
+            if res.returncode != 0:
+                raise RuntimeError(
+                    f"Manifest generation failed: could not inspect v6 chain {table}:{chain} "
+                    f"(code {res.returncode}): {res.stderr or res.stdout}"
+                )
+            # P1-1: Preserve exact rule order (no sorting)
+            canon = "\n".join(l.strip() for l in res.stdout.splitlines() if l.strip())
+            manifest["chain_fingerprints"][f"v6:{table}:{chain}"] = hashlib.sha256(canon.encode()).hexdigest()
+
+        total_expected = len(table_chains_v4) + len(table_chains_v6)
+        if len(manifest["chain_fingerprints"]) != total_expected:
+            raise RuntimeError(
+                f"Manifest generation incomplete: expected {total_expected} fingerprints, "
+                f"got {len(manifest['chain_fingerprints'])}"
+            )
 
         return manifest
 
@@ -994,6 +1236,10 @@ class nulltrace:
             "iptables_v6_hash": getattr(self, "_iptables_v6_hash", None),
             "custom_chains": list(ALL_OWNED_CHAINS),
             "enforcement_manifest": manifest,
+            "tor_config_existed": getattr(self, "_tor_config_existed", True),
+            "tor_service_initially_active": getattr(self, "_tor_initially_active", True),
+            "tor_service_initially_enabled": getattr(self, "_tor_initially_enabled", True),
+            "interface_initially_up": getattr(self, "_interface_initially_up", True),
             "failures": getattr(self, "_restore_failures", []),
         }
 
@@ -1111,20 +1357,34 @@ class nulltrace:
         if total_nulltrace_lines == 0:
             return LiveFirewallStatus.CLEAN
 
-        # 1. Verify expected v4 jumps exist exactly once
+        # 1. Verify expected v4 jumps exist as exact first rule in base chains (P0-2)
         for table, base_chain, target_chain in required_v4_jumps:
             lines = table_rules_v4.get(table, [])
+            base_rules = [l for l in lines if l.startswith(f"-A {base_chain} ")]
+            if not base_rules:
+                return LiveFirewallStatus.PARTIAL
             expected_jump = f"-A {base_chain} -j {target_chain}"
-            matching = [l for l in lines if l == expected_jump or (l.startswith(f"-A {base_chain} ") and f"-j {target_chain}" in l)]
-            if len(matching) != 1:
+            if base_rules[0] != expected_jump:
+                return LiveFirewallStatus.PARTIAL
+            target_occurrences = [l for l in base_rules if target_chain in l]
+            if len(target_occurrences) != 1:
+                return LiveFirewallStatus.PARTIAL
+            if any(l != expected_jump and f"-j {target_chain}" in l for l in lines):
                 return LiveFirewallStatus.PARTIAL
 
-        # 2. Verify expected v6 jumps exist exactly once
+        # 2. Verify expected v6 jumps exist as exact first rule in base chains (P0-2)
         for table, base_chain, target_chain in required_v6_jumps:
             lines = table_rules_v6.get(table, [])
+            base_rules = [l for l in lines if l.startswith(f"-A {base_chain} ")]
+            if not base_rules:
+                return LiveFirewallStatus.PARTIAL
             expected_jump = f"-A {base_chain} -j {target_chain}"
-            matching = [l for l in lines if l == expected_jump or (l.startswith(f"-A {base_chain} ") and f"-j {target_chain}" in l)]
-            if len(matching) != 1:
+            if base_rules[0] != expected_jump:
+                return LiveFirewallStatus.PARTIAL
+            target_occurrences = [l for l in base_rules if target_chain in l]
+            if len(target_occurrences) != 1:
+                return LiveFirewallStatus.PARTIAL
+            if any(l != expected_jump and f"-j {target_chain}" in l for l in lines):
                 return LiveFirewallStatus.PARTIAL
 
         # 3. Verify each owned v4 chain exists and inspect its contents (P0.2)
@@ -1202,34 +1462,52 @@ class nulltrace:
             except OSError:
                 return LiveFirewallStatus.UNKNOWN
 
-        # 5. Check manifest fingerprints if manifest exists
+        # 5. Check manifest fingerprints (P1-1, P1-3: mandatory for ACTIVE)
         meta = self._load_session_metadata()
         manifest = None
         if meta and "enforcement_manifest" in meta:
             manifest = meta["enforcement_manifest"]
         elif self._session_id:
-            m_path = self._session_dir() / "manifest.json"
-            if m_path.exists():
-                try:
+            try:
+                m_path = self._session_dir() / "manifest.json"
+                if m_path.exists():
                     manifest = json.loads(m_path.read_text(encoding="utf-8"))
-                except Exception:
-                    pass
+            except Exception:
+                return LiveFirewallStatus.PARTIAL
 
-        if manifest and "chain_fingerprints" in manifest:
-            fps = manifest["chain_fingerprints"]
-            for key, expected_hash in fps.items():
-                family, table, chain = key.split(":")
-                bin_cmd = iptables_bin if family == "v4" else ip6tables_bin
-                try:
-                    res = run_trusted([bin_cmd, "-t", table, "-S", chain], check=False)
-                    if res.returncode != 0:
-                        return LiveFirewallStatus.PARTIAL
-                    canon = "\n".join(sorted(l.strip() for l in res.stdout.splitlines() if l.strip()))
-                    live_hash = hashlib.sha256(canon.encode()).hexdigest()
-                    if live_hash != expected_hash:
-                        return LiveFirewallStatus.PARTIAL
-                except Exception:
-                    return LiveFirewallStatus.UNKNOWN
+        if not manifest or not isinstance(manifest, dict):
+            # Missing or corrupt manifest cannot yield ACTIVE (P1-3)
+            return LiveFirewallStatus.PARTIAL
+
+        fps = manifest.get("chain_fingerprints")
+        if not fps or not isinstance(fps, dict):
+            return LiveFirewallStatus.PARTIAL
+
+        # Require all 11 chains to be present in manifest (P1-3)
+        expected_chains = [
+            f"v4:{t}:{c}" for t, c in v4_chains
+        ] + [
+            f"v6:{t}:{c}" for t, c in v6_chains
+        ]
+        for key in expected_chains:
+            if key not in fps:
+                return LiveFirewallStatus.PARTIAL
+
+        # Verify fingerprints in exact rule order without sorting (P1-1)
+        for key in expected_chains:
+            expected_hash = fps[key]
+            family, table, chain = key.split(":")
+            bin_cmd = iptables_bin if family == "v4" else ip6tables_bin
+            try:
+                res = run_trusted([bin_cmd, "-t", table, "-S", chain], check=False)
+                if res.returncode != 0:
+                    return LiveFirewallStatus.PARTIAL
+                canon = "\n".join(l.strip() for l in res.stdout.splitlines() if l.strip())
+                live_hash = hashlib.sha256(canon.encode()).hexdigest()
+                if live_hash != expected_hash:
+                    return LiveFirewallStatus.PARTIAL
+            except Exception:
+                return LiveFirewallStatus.UNKNOWN
 
         return LiveFirewallStatus.ACTIVE
 
@@ -1491,7 +1769,7 @@ class nulltrace:
         else:
             errors.append("service not found in trusted directories")
 
-        # 3. For status check, fall back to pgrep
+        # 3. For status check, fall back to pgrep with strong process identity validation (P1-4)
         if action == "is-active":
             pgrep_bin = resolve_trusted_binary("pgrep")
             if pgrep_bin:
@@ -1500,10 +1778,16 @@ class nulltrace:
                         res = run_trusted(
                             [pgrep_bin, "-x", proc_name],
                             capture_output=True,
+                            text=True,
                             check=False,
                         )
-                        if res.returncode == 0:
-                            return True, f"pgrep found active {proc_name} process"
+                        if res.returncode == 0 and res.stdout:
+                            candidate_pids = [
+                                int(p) for p in res.stdout.strip().split() if p.isdigit()
+                            ]
+                            for cpid in candidate_pids:
+                                if self._verify_process_is_tor(cpid):
+                                    return True, f"pgrep found verified Tor process (pid={cpid})"
                     except OSError:
                         pass
 
@@ -1515,7 +1799,7 @@ class nulltrace:
 
     def _verify_process_is_tor(self, pid: int) -> bool:
         """
-        Verify that pid is genuine Tor daemon by checking UID and executable path (P1.1, P2.4).
+        Verify that pid is genuine Tor daemon by checking UID and executable path (P1.1, P2.4, P2-6).
         """
         if pid <= 0:
             return False
@@ -1549,7 +1833,11 @@ class nulltrace:
                     pass
 
         if expected_uid is not None:
-            if eff_uid != expected_uid and real_uid != expected_uid:
+            # Effective UID must strictly match expected Tor UID (P2-6)
+            if eff_uid != expected_uid:
+                return False
+            # Real UID must either match expected Tor UID or root (privilege drop service) (P2-6)
+            if real_uid not in (expected_uid, 0):
                 return False
 
         # 2. Executable target check from /proc/<pid>/exe
@@ -1583,12 +1871,13 @@ class nulltrace:
 
         return True
 
-    def _find_pid_by_socket_inode(self, inode: str) -> Optional[int]:
-        """Search /proc/<pid>/fd/ to map socket inode to owning PID (P2.4)."""
+    def _find_pids_by_socket_inode(self, inode: str) -> List[int]:
+        """Search /proc/<pid>/fd/ to map socket inode to all owning PIDs (P2.4, P2-5)."""
         proc_root = Path("/proc")
+        pids: List[int] = []
         try:
             if not proc_root.is_dir():
-                return None
+                return []
             for p_dir in proc_root.iterdir():
                 if not p_dir.is_dir() or not p_dir.name.isdigit():
                     continue
@@ -1600,22 +1889,29 @@ class nulltrace:
                     for fd in fd_dir.iterdir():
                         try:
                             if os.readlink(str(fd)) == f"socket:[{inode}]":
-                                return candidate_pid
+                                pids.append(candidate_pid)
+                                break
                         except OSError:
                             continue
                 except OSError:
                     continue
         except OSError:
             pass
-        return None
+        return pids
+
+    def _find_pid_by_socket_inode(self, inode: str) -> Optional[int]:
+        """Map socket inode to first verified Tor PID or first candidate PID (backwards-compat)."""
+        pids = self._find_pids_by_socket_inode(inode)
+        for pid in pids:
+            if self._verify_process_is_tor(pid):
+                return pid
+        return pids[0] if pids else None
 
     def _verify_listener_ownership(self, port: int, proto: str) -> bool:
         """
-        Verify that configured listener port is strictly owned by intended Tor daemon process (P1.1, P2.4).
-        Rejects rogue listeners, spoofed comm names, wrong UIDs, or untrusted executables.
+        Verify that configured listener port is strictly owned by intended Tor daemon process (P1.1, P2.4, P2-5).
+        Rejects rogue listeners, spoofed comm names, wrong UIDs, untrusted executables, or ambiguous owners.
         """
-        inspected = False
-
         # 1. Check socket ownership via ss if available
         ss_bin = resolve_trusted_binary("ss")
         if ss_bin:
@@ -1623,9 +1919,10 @@ class nulltrace:
             try:
                 res = run_trusted([ss_bin, "-H", flag, f"sport = :{port}"], check=False)
                 if res.returncode == 0:
-                    inspected = True
-                    lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
-                    found_any_socket = False
+                    lines = [l.strip() for l in (res.stdout or "").strip().splitlines() if l.strip()]
+                    if not lines:
+                        return False
+                    candidate_pids: Set[int] = set()
                     for line in lines:
                         parts = line.split()
                         local_addr = ""
@@ -1641,31 +1938,30 @@ class nulltrace:
                             host = host.strip("[]")
                             if p_str and p_str != str(port):
                                 continue
-                            found_any_socket = True
                             if host not in ("127.0.0.1", self.config.localhost):
                                 return False
 
-                        pid_match = re.search(r"pid=(\d+)", line)
-                        if pid_match:
-                            found_any_socket = True
-                            pid = int(pid_match.group(1))
-                            if self._verify_process_is_tor(pid):
-                                return True
-                            if not Path("/proc").is_dir() and re.search(r'users:\(\("tor(?:\.real)?"', line):
-                                return True
-                            return False
-                    if found_any_socket:
+                        for m in re.finditer(r"pid=(\d+)", line):
+                            candidate_pids.add(int(m.group(1)))
+
+                    if not candidate_pids:
                         return False
+
+                    # All candidate PIDs must be verified Tor processes (P2-5)
+                    for pid in candidate_pids:
+                        if not self._verify_process_is_tor(pid):
+                            return False
+                    return True
             except OSError:
                 pass
 
-        # 2. Check /proc/net/{tcp,udp} and search /proc/<pid>/fd/ for socket inode (P2.4)
+        # 2. Check /proc/net/{tcp,udp} and search /proc/<pid>/fd/ for socket inode (P2.4, P2-5)
         proc_file = Path(f"/proc/net/{proto.lower()}")
         if proc_file.exists():
             try:
                 tor_uid_int = int(self.tor_user) if (self.tor_user and self.tor_user.isdigit()) else None
                 hex_port = f"{port:04X}"
-                matching_inodes = []
+                matching_inodes: List[str] = []
                 for line in proc_file.read_text(encoding="utf-8").splitlines()[1:]:
                     parts = line.strip().split()
                     if len(parts) >= 10:
@@ -1684,18 +1980,22 @@ class nulltrace:
                                 inode = parts[9]
                                 matching_inodes.append(inode)
 
-                inspected = True
                 if not matching_inodes:
                     return False
 
+                all_candidates: List[int] = []
                 for inode in matching_inodes:
-                    candidate_pid = self._find_pid_by_socket_inode(inode)
-                    if candidate_pid is not None:
-                        if self._verify_process_is_tor(candidate_pid):
-                            return True
-                    elif not Path("/proc").is_dir():
-                        return True
-                return False
+                    pids = self._find_pids_by_socket_inode(inode)
+                    all_candidates.extend(pids)
+
+                if not all_candidates:
+                    return False
+
+                # All candidate processes sharing this socket must be verified Tor (P2-5)
+                for pid in all_candidates:
+                    if not self._verify_process_is_tor(pid):
+                        return False
+                return True
             except (OSError, ValueError):
                 pass
 
@@ -1815,13 +2115,13 @@ class nulltrace:
             self._iptables_v6_hash = hashlib.sha256(res_v6.stdout.encode()).hexdigest()
 
     def backup_tor_config(self) -> None:
-        """Session-bound backup of Tor configuration (NT-010, NT-014, NT-015, P1.8)."""
+        """Session-bound backup of Tor configuration (NT-010, NT-014, NT-015, P1.8, P1-9)."""
         path = self.validate_tor_config_target(self.config.tor_config)
         sdir = self._session_dir()
         sdir.mkdir(parents=True, exist_ok=True)
         backup_path = sdir / "torrc.bak"
 
-        # P1.8: Baseline snapshot must be taken exactly once per session.
+        # Baseline snapshot must be taken exactly once per session.
         if backup_path.exists():
             if not getattr(self, "_tor_config_hash", None):
                 content = backup_path.read_text(encoding="utf-8")
@@ -1829,10 +2129,12 @@ class nulltrace:
             return
 
         if path.exists():
+            self._tor_config_existed = True
             clean_content = strip_tor_config_blocks(path.read_text(encoding="utf-8"))
             atomic_write(backup_path, clean_content, mode=0o600)
             self._tor_config_hash = hashlib.sha256(clean_content.encode()).hexdigest()
         else:
+            self._tor_config_existed = False
             atomic_write(backup_path, "", mode=0o600)
             self._tor_config_hash = hashlib.sha256(b"").hexdigest()
 
@@ -1852,32 +2154,59 @@ class nulltrace:
 
     def restore_tor_config(self) -> None:
         """
-        Restore Tor configuration preserving administrator changes (NT-010, NT-014, NT-015, P1.3, P2.4).
+        Restore Tor configuration preserving administrator changes (NT-010, NT-014, NT-015, P1.3, P1-9, P1-10, P2.4).
         Strips only the nulltrace-managed block from the live torrc file.
+        Restores original file existence and Tor service state.
         """
         sdir = self._session_dir()
         backup_path = sdir / "torrc.bak"
         path = self.validate_tor_config_target(self.config.tor_config)
 
-        if path.exists():
-            current_content = path.read_text(encoding="utf-8")
-            if torrc_has_managed_block(current_content):
-                cleaned = strip_tor_config_blocks(current_content)
-                atomic_write(path, cleaned)
-            elif backup_path.exists():
-                baseline_content = backup_path.read_text(encoding="utf-8")
-                if current_content == baseline_content:
-                    atomic_write(path, baseline_content)
-            self._tor_file_restored = True
-        elif backup_path.exists():
-            content = strip_tor_config_blocks(backup_path.read_text(encoding="utf-8"))
-            atomic_write(path, content)
-            self._tor_file_restored = True
+        meta = self._load_session_metadata() or {}
+        tor_config_existed = meta.get("tor_config_existed", getattr(self, "_tor_config_existed", True))
 
-        ok, detail = self._control_tor_service("restart")
+        if not tor_config_existed:
+            # File did not exist initially (P1-9)
+            if path.exists():
+                current_content = path.read_text(encoding="utf-8")
+                cleaned = strip_tor_config_blocks(current_content) if torrc_has_managed_block(current_content) else current_content
+                if not cleaned.strip():
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                else:
+                    # Admin added settings outside managed block -> preserve admin changes
+                    atomic_write(path, cleaned)
+            self._tor_file_restored = True
+        else:
+            if path.exists():
+                current_content = path.read_text(encoding="utf-8")
+                if torrc_has_managed_block(current_content):
+                    cleaned = strip_tor_config_blocks(current_content)
+                    atomic_write(path, cleaned)
+                elif backup_path.exists():
+                    baseline_content = backup_path.read_text(encoding="utf-8")
+                    if current_content == baseline_content:
+                        atomic_write(path, baseline_content)
+                self._tor_file_restored = True
+            elif backup_path.exists():
+                content = strip_tor_config_blocks(backup_path.read_text(encoding="utf-8"))
+                atomic_write(path, content)
+                self._tor_file_restored = True
+
+        # Restore original Tor service state (P1-10)
+        tor_initially_active = meta.get("tor_service_initially_active", getattr(self, "_tor_initially_active", True))
+        tor_initially_enabled = meta.get("tor_service_initially_enabled", getattr(self, "_tor_initially_enabled", True))
+
+        action = "restart" if tor_initially_active else "stop"
+        ok, detail = self._control_tor_service(action)
         if not ok:
             self._tor_service_restored = False
-            raise RuntimeError(f"Tor configuration restored on disk, but Tor service restart failed: {detail}")
+            raise RuntimeError(f"Tor configuration restored on disk, but Tor service {action} failed: {detail}")
+
+        if not tor_initially_enabled:
+            self._control_tor_service("disable")
 
         self._tor_service_restored = True
 
@@ -1995,8 +2324,41 @@ class nulltrace:
         elif nmcli_bin:
             run_trusted([nmcli_bin, "device", "reapply", intf], check=False)
 
+    def _is_interface_up(self, intf: str) -> bool:
+        """Check whether network interface is administratively UP (P1-11)."""
+        sysfs_flags = Path(f"/sys/class/net/{intf}/flags")
+        if sysfs_flags.exists():
+            try:
+                flags_val = int(sysfs_flags.read_text(encoding="utf-8").strip(), 16)
+                return bool(flags_val & 0x1)  # IFF_UP = 0x1
+            except (OSError, ValueError):
+                pass
+        sysfs_operstate = Path(f"/sys/class/net/{intf}/operstate")
+        if sysfs_operstate.exists():
+            try:
+                state_str = sysfs_operstate.read_text(encoding="utf-8").strip().lower()
+                if state_str == "up":
+                    return True
+                if state_str == "down":
+                    return False
+            except OSError:
+                pass
+        ip_bin = resolve_trusted_binary("ip")
+        if ip_bin:
+            try:
+                res = run_trusted([ip_bin, "link", "show", "dev", intf], check=False)
+                if res.returncode == 0:
+                    out = res.stdout or ""
+                    if "state UP" in out or "<UP" in out or ",UP" in out:
+                        return True
+                    if "state DOWN" in out:
+                        return False
+            except OSError:
+                pass
+        return True
+
     def _randomize_mac(self) -> None:
-        """Persist original hardware MAC and randomize using macchanger (NT-011)."""
+        """Persist original hardware MAC and randomize using macchanger (NT-011, P1-11)."""
         macchanger_bin = resolve_trusted_binary("macchanger")
         if not macchanger_bin:
             raise RuntimeError(
@@ -2017,9 +2379,10 @@ class nulltrace:
 
         self._spoofed_intf = intf
         self._original_mac = original_mac
+        self._interface_initially_up = self._is_interface_up(intf)
         self._persist_session_metadata()
 
-        print(f"[*] Original MAC recorded: {original_mac} for interface: {intf}")
+        print(f"[*] Original MAC recorded: {original_mac} for interface: {intf} (initially UP: {self._interface_initially_up})")
         print(f"[*] Randomizing MAC address for interface: {intf}...")
 
         ip_bin = require_trusted_binary("ip")
@@ -2036,15 +2399,18 @@ class nulltrace:
             raise RuntimeError(f"Failed to randomize MAC on {intf}: {exc}. Reverted.") from exc
 
     def _restore_mac(self) -> None:
-        """Restore original hardware MAC independently of macchanger (NT-011)."""
+        """Restore original hardware MAC and administrative state independently of macchanger (NT-011, P1-11)."""
         intf = self._spoofed_intf
         original_mac = self._original_mac
+        initially_up = getattr(self, "_interface_initially_up", True)
 
         if not intf or not original_mac:
             meta = self._load_session_metadata()
             if meta:
                 intf = intf or meta.get("spoofed_intf")
                 original_mac = original_mac or meta.get("original_mac")
+                if "interface_initially_up" in meta:
+                    initially_up = meta["interface_initially_up"]
 
         if not intf or not original_mac:
             return
@@ -2055,7 +2421,10 @@ class nulltrace:
         try:
             run_trusted([ip_bin, "link", "set", intf, "down"], check=True)
             run_trusted([ip_bin, "link", "set", "dev", intf, "address", original_mac], check=True)
-            run_trusted([ip_bin, "link", "set", intf, "up"], check=True)
+            if initially_up:
+                run_trusted([ip_bin, "link", "set", intf, "up"], check=True)
+            else:
+                run_trusted([ip_bin, "link", "set", intf, "down"], check=False)
 
             current_mac = self._read_current_mac(intf)
             if current_mac and current_mac.lower() != original_mac.lower():
@@ -2064,11 +2433,15 @@ class nulltrace:
                 )
 
             print(f"[+] Original MAC {original_mac} verified restored.")
-            self._renew_dhcp(intf)
+            if initially_up:
+                self._renew_dhcp(intf)
             self._mac_restored = True
             self._persist_session_metadata()
         except Exception as exc:
-            run_trusted([ip_bin, "link", "set", intf, "up"], check=False)
+            if initially_up:
+                run_trusted([ip_bin, "link", "set", intf, "up"], check=False)
+            else:
+                run_trusted([ip_bin, "link", "set", intf, "down"], check=False)
             raise RuntimeError(
                 f"Failed to restore original MAC {original_mac} on {intf}: {exc}. "
                 f"MANUAL ACTION: Run 'sudo ip link set dev {intf} address {original_mac}'"
@@ -2498,9 +2871,31 @@ class nulltrace:
             self._restore_failures = []
             self._set_state(STATE_INACTIVE)
 
+    def _check_tor_service_enabled(self) -> bool:
+        """Check if Tor service is initially enabled in systemd (P1-10)."""
+        systemctl_bin = resolve_trusted_binary("systemctl")
+        if systemctl_bin:
+            checked_any = False
+            for svc in ("tor@default", "tor"):
+                try:
+                    res = run_trusted([systemctl_bin, "is-enabled", svc], capture_output=True, text=True, check=False)
+                    out = (res.stdout or "").strip().lower()
+                    if res.returncode == 0 and "enabled" in out:
+                        return True
+                    if "disabled" in out or "masked" in out:
+                        return False
+                    if res.returncode != 0:
+                        checked_any = True
+                except OSError:
+                    pass
+            if checked_any:
+                return False
+        return True
+
     def setup_network_rules(self) -> None:
         """
-        Transactional activation of nulltrace privacy routing (NT-001, NT-002, NT-003, NT-004, P0.2, P0.5).
+        Durable multi-phase activation of nulltrace privacy routing (NT-001, NT-002, NT-003, NT-004, P0.2, P0.5, P2-7).
+        Persists pre-change state before mutation; each intermediate phase is verified or rolled back fail-closed.
         """
         require_linux_root("configure network routing")
         self._acquire_lock()
@@ -2533,6 +2928,10 @@ class nulltrace:
             self._session_created_at = datetime.now().isoformat()
             self._set_state(STATE_PREPARING)
 
+            # P1-10: Capture initial Tor service state before any modifications
+            self._tor_initially_active = self.check_tor_service()
+            self._tor_initially_enabled = self._check_tor_service_enabled()
+
             # Signal handler for clean rollback on interruption (NT-003)
             def _sig_handler(signum, frame):
                 print(f"\n[!] Interrupted by signal {signum}. Rolling back...")
@@ -2555,7 +2954,7 @@ class nulltrace:
             print("[*] Applying Tor configuration...")
             self.apply_tor_config()
 
-            print("[*] Constructing transactional firewall chains...")
+            print("[*] Constructing firewall chains...")
             self._setup_custom_chains_v4()
             self._setup_custom_chains_v6()
 
@@ -2661,6 +3060,7 @@ class nulltrace:
                     print(f"[!] Firewall custom chain teardown incomplete ({teardown_status})")
                     if destructive:
                         print("[!] WARNING: Destructive recovery requested. Overwriting live firewall with session snapshot...")
+                        print("    WARNING: This operation can overwrite firewall changes made after NullTrace activation.")
                         try:
                             self.restore_iptables_from_backup()
                             teardown_status2 = self._verify_firewall_teardown(return_status=True)
@@ -2952,7 +3352,7 @@ def build_parser() -> ArgumentParser:
     parser.add_argument(
         "--destructive-restore",
         action="store_true",
-        help="Allow destructive whole-table firewall restore on teardown failure",
+        help="Last-resort recovery: allow destructive whole-table firewall restore on teardown failure. WARNING: This operation can overwrite firewall changes made after NullTrace activation.",
     )
     parser.add_argument("-n", "--new-ip", action="store_true", help="Request new Tor identity")
     parser.add_argument("-i", "--ip", action="store_true", help="Show current public IP")

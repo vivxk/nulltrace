@@ -2,6 +2,7 @@
 import argparse
 import errno
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -12,12 +13,45 @@ from typing import Dict, List, Optional, Sequence, Union
 TRUSTED_BIN_DIRS = ("/usr/sbin", "/usr/bin", "/sbin", "/bin")
 
 
+def validate_trusted_directory_hierarchy(path: Path) -> bool:
+    """Validate directory hierarchy of candidate binary (root-owned, not group/world writable) (Section 21)."""
+    if os.name == "nt" and not getattr(os, "_force_posix_security_checks", False):
+        return True
+    try:
+        curr = path if path.is_dir() else path.parent
+        while curr.as_posix() not in ("", "/"):
+            if curr.exists() or os.path.islink(str(curr)):
+                st = os.lstat(str(curr))
+                if stat.S_ISLNK(st.st_mode):
+                    if hasattr(st, "st_uid") and st.st_uid != 0:
+                        return False
+                    target = curr.resolve()
+                    if not target.exists():
+                        return False
+                    tst = os.stat(str(target))
+                    if hasattr(tst, "st_uid") and tst.st_uid != 0:
+                        return False
+                    if tst.st_mode & 0o022:
+                        return False
+                else:
+                    if hasattr(st, "st_uid") and st.st_uid != 0:
+                        return False
+                    if st.st_mode & 0o022:
+                        return False
+            if curr.parent == curr:
+                break
+            curr = curr.parent
+        return True
+    except OSError:
+        return False
+
+
 def resolve_trusted_binary(name: str) -> Optional[str]:
     """
-    Resolve binary strictly to a trusted system directory (NT-006, P1-5).
+    Resolve binary strictly to a trusted system directory (NT-006, P1-5, Section 21).
     Rejects relative lookups, path traversals, non-root-owned binaries,
-    group/world-writable binaries, non-regular files, and symlinks resolving
-    outside approved trusted directories.
+    group/world-writable binaries, non-regular files, symlinks resolving
+    outside approved trusted directories, and untrusted directory hierarchies.
     """
     if not name or not isinstance(name, str):
         return None
@@ -64,6 +98,8 @@ def resolve_trusted_binary(name: str) -> Optional[str]:
                 target_st = os.stat(str(target))
             except OSError:
                 continue
+            if not validate_trusted_directory_hierarchy(target):
+                continue
         else:
             if not stat.S_ISREG(lst.st_mode):
                 continue
@@ -81,6 +117,9 @@ def resolve_trusted_binary(name: str) -> Optional[str]:
         if hasattr(target_st, "st_uid") and (os.name != "nt" or getattr(os, "_force_posix_security_checks", False)):
             if target_st.st_uid != 0:
                 continue
+
+        if not validate_trusted_directory_hierarchy(candidate):
+            continue
 
         return candidate.as_posix()
 
@@ -300,6 +339,13 @@ def secure_deploy_file(
     if not parent_dir.is_absolute():
         parent_dir = Path.cwd() / parent_dir
 
+    if dest_path.is_symlink() or os.path.islink(str(dest_path)):
+        raise ValueError(f"Target path '{dest_path}' is an untrusted symlink; refusing install.")
+    if parent_dir.is_symlink() or os.path.islink(str(parent_dir)):
+        raise ValueError(f"Target directory '{parent_dir}' is an untrusted symlink; refusing install.")
+    if parent_dir.exists() and not parent_dir.is_dir():
+        raise ValueError(f"Target parent directory '{parent_dir}' is not a directory.")
+
     if os.name == "nt" and not getattr(os, "_force_posix_security_checks", False):
         parent_dir.mkdir(parents=True, exist_ok=True)
         tmp = parent_dir / f".{dest_path.name}.tmp_{os.urandom(6).hex()}"
@@ -309,11 +355,6 @@ def secure_deploy_file(
             tmp.write_bytes(source_content)
         os.replace(tmp, dest_path)
         return
-
-    if dest_path.is_symlink() or os.path.islink(str(dest_path)):
-        raise ValueError(f"Target path '{dest_path}' is an untrusted symlink; refusing install.")
-    if parent_dir.is_symlink() or os.path.islink(str(parent_dir)):
-        raise ValueError(f"Target directory '{parent_dir}' is an untrusted symlink; refusing install.")
 
     dir_fd = secure_open_dir_hierarchy(parent_dir, target_uid=0, target_gid=0)
     if dir_fd is None:
@@ -399,22 +440,49 @@ def secure_deploy_file(
 
 
 def install_nulltrace():
+    """
+    Install nulltrace system-wide.
+    Trust model: Executing this installer as root explicitly trusts the source tree
+    from which install.py is being executed (P2 - Section 22).
+    Verifies that nulltrace.py is a regular file and not a symlink before deployment.
+    """
     check_dependencies()
     try:
         source = Path(__file__).resolve().parent / "nulltrace.py"
-        if not source.is_file():
+        if not source.exists():
             print(f"[!] nulltrace.py not found beside installer: {source}")
+            sys.exit(1)
+        lst = os.lstat(str(source))
+        if stat.S_ISLNK(lst.st_mode) or source.is_symlink():
+            print(f"[!] Security violation: source file '{source}' is a symlink; refusing install.")
+            sys.exit(1)
+        if not stat.S_ISREG(lst.st_mode):
+            print(f"[!] Security violation: source file '{source}' is not a regular file; refusing install.")
             sys.exit(1)
 
         share_dir = Path("/usr/share/nulltrace")
-        if not share_dir.exists():
+        if share_dir.exists() or os.path.islink(str(share_dir)):
+            if share_dir.is_symlink() or stat.S_ISLNK(os.lstat(str(share_dir)).st_mode):
+                print(f"[!] Security violation: target directory '{share_dir}' is a symlink; refusing install.")
+                sys.exit(1)
+            st_share = os.lstat(str(share_dir))
+            if not stat.S_ISDIR(st_share.st_mode):
+                print(f"[!] Security violation: target directory '{share_dir}' is not a directory; refusing install.")
+                sys.exit(1)
+            if hasattr(os, "geteuid") and os.geteuid() == 0 and st_share.st_uid != 0:
+                print(f"[!] Security violation: target directory '{share_dir}' is not root-owned; refusing install.")
+                sys.exit(1)
+            if st_share.st_mode & 0o022:
+                print(f"[!] Security violation: target directory '{share_dir}' is group/world writable ({oct(st_share.st_mode)}); refusing install.")
+                sys.exit(1)
+        else:
             share_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
             if hasattr(os, "chmod"):
                 os.chmod(str(share_dir), 0o755)
 
         secure_deploy_file(source.read_bytes(), share_dir / "nulltrace.py", mode=0o755)
 
-        python3_bin = resolve_trusted_binary("python3") or "/usr/bin/python3"
+        python3_bin = require_trusted_binary("python3")
         launcher_content = f"""#!/bin/sh
 exec {python3_bin} /usr/share/nulltrace/nulltrace.py "$@"
 """
@@ -434,11 +502,37 @@ class FirewallInspectionResult:
     UNKNOWN = "UNKNOWN"
 
 
+OWNED_NULLTRACE_CHAINS = {
+    "NULLTRACE_OUTPUT", "NULLTRACE_INPUT", "NULLTRACE_FORWARD",
+    "NULLTRACE_NAT_OUTPUT", "NULLTRACE_MANGLE_OUTPUT", "NULLTRACE_MANGLE_PREROUTING",
+    "NULLTRACE_V6_OUTPUT", "NULLTRACE_V6_INPUT", "NULLTRACE_V6_FORWARD",
+    "NULLTRACE_V6_MANGLE_OUTPUT", "NULLTRACE_V6_MANGLE_PRE",
+}
+
+
+def is_line_nulltrace_owned(line: str) -> bool:
+    """Check if iptables -S line defines or targets an authentic NullTrace chain (P2 - Section 26)."""
+    tokens = line.strip().split()
+    if not tokens:
+        return False
+    if tokens[0] == "-N" and len(tokens) >= 2 and tokens[1] in OWNED_NULLTRACE_CHAINS:
+        return True
+    if "-j" in tokens:
+        idx = tokens.index("-j")
+        if idx + 1 < len(tokens) and tokens[idx + 1] in OWNED_NULLTRACE_CHAINS:
+            return True
+    if "--comment" in tokens:
+        idx = tokens.index("--comment")
+        if idx + 1 < len(tokens) and tokens[idx + 1].strip('"\'') == "nulltrace-owned":
+            return True
+    return False
+
+
 def inspect_live_nulltrace_rules() -> str:
     """
-    Tri-state inspection of live iptables/ip6tables rulesets (P1.5, P1-7):
-    - CLEAN: binaries ran successfully and no NULLTRACE chains or rules exist in any table.
-    - ACTIVE: binaries ran successfully and NULLTRACE chains or rules exist.
+    Tri-state inspection of live iptables/ip6tables rulesets (P1.5, P1-7, Section 26):
+    - CLEAN: binaries ran successfully and no authentic NULLTRACE chains or rules exist in any table.
+    - ACTIVE: binaries ran successfully and authentic NULLTRACE chains or rules exist.
     - UNKNOWN: iptables or ip6tables binary missing, unusable, or inspection command errored.
     """
     iptables_bin = resolve_trusted_binary("iptables")
@@ -458,7 +552,7 @@ def inspect_live_nulltrace_rules() -> str:
                     continue
                 return FirewallInspectionResult.UNKNOWN
             for line in res.stdout.splitlines():
-                if "NULLTRACE" in line:
+                if is_line_nulltrace_owned(line):
                     found_active = True
         except Exception:
             return FirewallInspectionResult.UNKNOWN
@@ -472,7 +566,7 @@ def inspect_live_nulltrace_rules() -> str:
                     continue
                 return FirewallInspectionResult.UNKNOWN
             for line in res.stdout.splitlines():
-                if "NULLTRACE" in line:
+                if is_line_nulltrace_owned(line):
                     found_active = True
         except Exception:
             return FirewallInspectionResult.UNKNOWN
@@ -489,27 +583,23 @@ def has_live_nulltrace_rules() -> bool:
 
 def routing_may_be_active() -> bool:
     """
-    Check if nulltrace routing is active via live firewall inspection or persisted state (P1.5, P2.5).
+    Check if nulltrace routing is active via live firewall inspection or authoritative state (P1.5, P2.5, Section 25).
+    Historical stale sessions cannot make a clean current system appear active.
     """
     # 1. Inspect live firewall rules first (P1.5, P2.5)
     if has_live_nulltrace_rules():
         return True
 
-    # 2. Inspect state files
-    candidates = [
-        Path("/var/lib/nulltrace/state.json"),
-        Path("/run/nulltrace/state.json"),
-    ]
-    pdir = Path("/var/lib/nulltrace")
-    if pdir.exists():
-        candidates.extend(pdir.glob("session_*/metadata.json"))
-
-    for p in candidates:
-        if p.exists():
+    # 2. Inspect authoritative current state files only
+    for sf in (Path("/var/lib/nulltrace/state.json"), Path("/run/nulltrace/state.json")):
+        if sf.exists():
             try:
                 import json
-                data = json.loads(p.read_text(encoding="utf-8"))
-                if data.get("state") in (
+                data = json.loads(sf.read_text(encoding="utf-8"))
+                st = data.get("state")
+                if st == "INACTIVE":
+                    return False
+                if st in (
                     "ACTIVE", "ACTIVATING", "PREPARING", "RESTORING",
                     "RESTORE_FAILED", "RECOVERY_REQUIRED"
                 ) or data.get("active"):
@@ -539,7 +629,7 @@ def uninstall_nulltrace(
         print("[!] nulltrace routing appears to be active or uncleaned.")
         print("    Attempting to safely restore network rules via nulltrace --force-stop...")
 
-        python3_bin = resolve_trusted_binary("python3") or "python3"
+        python3_bin = require_trusted_binary("python3")
         installed_script = Path("/usr/share/nulltrace/nulltrace.py")
         restore_ok = False
 
@@ -694,10 +784,28 @@ def uninstall_nulltrace(
         ]
         sudo_user = os.environ.get("SUDO_USER")
         if sudo_user and sudo_user != "root":
-            cfg_dirs.append(Path(f"/home/{sudo_user}") / ".config" / "nulltrace")
-        for cfg in cfg_dirs:
-            if cfg.exists():
+            if re.match(r"^[a-zA-Z0-9_.][a-zA-Z0-9_.-]*\$?$", sudo_user) and ".." not in sudo_user:
                 try:
+                    import pwd
+                    pw = pwd.getpwnam(sudo_user)
+                    if pw.pw_dir:
+                        p_dir = Path(pw.pw_dir)
+                        if p_dir.is_absolute() and ".." not in p_dir.parts:
+                            cfg_dirs.append(p_dir / ".config" / "nulltrace")
+                except (KeyError, ImportError, Exception):
+                    pass
+            else:
+                print(f"[!] Warning: Ignoring malformed SUDO_USER: '{sudo_user}'")
+
+        for cfg in cfg_dirs:
+            if cfg.exists() or os.path.islink(str(cfg)):
+                try:
+                    if ".." in cfg.parts or cfg.name != "nulltrace":
+                        print(f"[!] Warning: Refusing to purge suspicious path: {cfg}")
+                        continue
+                    if cfg.is_symlink() or os.path.islink(str(cfg)):
+                        print(f"[!] Warning: Refusing to purge symlink: {cfg}")
+                        continue
                     if cfg.is_dir():
                         shutil.rmtree(cfg)
                     else:

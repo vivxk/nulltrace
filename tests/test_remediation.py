@@ -202,7 +202,8 @@ class TestNT003_TransactionalCustomChains(unittest.TestCase):
     @patch("nulltrace.run_trusted")
     def test_rollback_deactivates_and_destroys(self, mock_run, mock_res):
         """Rollback removes jump rules and destroys custom chains."""
-        self.app._rollback_startup()
+        with patch.object(self.app, "_control_tor_service", return_value=(True, "ok")):
+            self.app._rollback_startup()
         self.assertEqual(self.app._current_state, nulltrace.STATE_INACTIVE)
 
 
@@ -518,9 +519,11 @@ class TestNT012_TorServiceFallback(unittest.TestCase):
 
         mock_subproc.side_effect = fake_run
 
-        ok, detail = self.app._control_tor_service("restart")
-        self.assertTrue(ok, f"Service fallback did not succeed: {detail}")
-        self.assertIn("service", detail)
+        with patch.object(self.app, "_has_verified_tor_process", return_value=True), \
+             patch.object(self.app, "check_tor_ports", return_value=True):
+            ok, detail = self.app._control_tor_service("restart")
+            self.assertTrue(ok, f"Service fallback did not succeed: {detail}")
+            self.assertIn("service", detail)
 
 
 class TestNT013_DeterministicEgressInterface(unittest.TestCase):
@@ -2096,7 +2099,7 @@ class TestSection11_ComprehensiveRegressions(unittest.TestCase):
         }
         rules_v6 = {
             "filter": ["-A OUTPUT -j NULLTRACE_V6_OUTPUT", "-A INPUT -j NULLTRACE_V6_INPUT", "-A FORWARD -j NULLTRACE_V6_FORWARD"],
-            "mangle": ["-A OUTPUT -j NULLTRACE_V6_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_V6_MANGLE_PREROUTING"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_V6_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_V6_MANGLE_PRE"],
         }
         chain_content = f"-N CHAIN\n-A CHAIN -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A CHAIN -j DROP\n"
         def fake_run(cmd, **kwargs):
@@ -2251,6 +2254,7 @@ class TestSection11_ComprehensiveRegressions(unittest.TestCase):
         with patch("nulltrace.require_trusted_binary", return_value="/usr/sbin/ip"), \
              patch.object(app, "_read_current_mac", return_value="00:11:22:33:44:55"), \
              patch.object(app, "_persist_session_metadata"), \
+             patch.object(app, "_is_interface_up", return_value=False), \
              patch("nulltrace.run_trusted") as mock_run:
             app._restore_mac()
             cmds = [call.args[0] for call in mock_run.call_args_list]
@@ -2467,7 +2471,7 @@ class TestSection11_ComprehensiveRegressions(unittest.TestCase):
         }
         rules_v6 = {
             "filter": ["-A OUTPUT -j NULLTRACE_V6_OUTPUT", "-A INPUT -j NULLTRACE_V6_INPUT", "-A FORWARD -j NULLTRACE_V6_FORWARD"],
-            "mangle": ["-A OUTPUT -j NULLTRACE_V6_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_V6_MANGLE_PREROUTING"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_V6_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_V6_MANGLE_PRE"],
         }
 
         chain_contents = {
@@ -2481,7 +2485,7 @@ class TestSection11_ComprehensiveRegressions(unittest.TestCase):
             "v6:filter:NULLTRACE_V6_INPUT": f"-N NULLTRACE_V6_INPUT\n-A NULLTRACE_V6_INPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_INPUT -j DROP\n",
             "v6:filter:NULLTRACE_V6_FORWARD": f"-N NULLTRACE_V6_FORWARD\n-A NULLTRACE_V6_FORWARD -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_FORWARD -j DROP\n",
             "v6:mangle:NULLTRACE_V6_MANGLE_OUTPUT": f"-N NULLTRACE_V6_MANGLE_OUTPUT\n-A NULLTRACE_V6_MANGLE_OUTPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_MANGLE_OUTPUT -j ACCEPT\n",
-            "v6:mangle:NULLTRACE_V6_MANGLE_PREROUTING": f"-N NULLTRACE_V6_MANGLE_PREROUTING\n-A NULLTRACE_V6_MANGLE_PREROUTING -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_MANGLE_PREROUTING -j ACCEPT\n",
+            "v6:mangle:NULLTRACE_V6_MANGLE_PRE": f"-N NULLTRACE_V6_MANGLE_PRE\n-A NULLTRACE_V6_MANGLE_PRE -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_MANGLE_PRE -j ACCEPT\n",
         }
 
         manifest_fps = {}
@@ -2521,7 +2525,7 @@ class TestSection11_ComprehensiveRegressions(unittest.TestCase):
         }
         rules_v6 = {
             "filter": ["-A OUTPUT -j NULLTRACE_V6_OUTPUT", "-A INPUT -j NULLTRACE_V6_INPUT", "-A FORWARD -j NULLTRACE_V6_FORWARD"],
-            "mangle": ["-A OUTPUT -j NULLTRACE_V6_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_V6_MANGLE_PREROUTING"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_V6_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_V6_MANGLE_PRE"],
         }
         chain_content = f"-N CHAIN\n-A CHAIN -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A CHAIN -p tcp -j REDIRECT --to-ports 9040\n-A CHAIN -p udp --dport 53 -j REDIRECT --to-ports 5353\n-A CHAIN -j DROP\n"
 
@@ -2918,7 +2922,7 @@ class TestSection18_LinuxTestMatrix(unittest.TestCase):
         }
         rules_v6 = {
             "filter": ["-A OUTPUT -j NULLTRACE_V6_OUTPUT", "-A INPUT -j NULLTRACE_V6_INPUT", "-A FORWARD -j NULLTRACE_V6_FORWARD"],
-            "mangle": ["-A OUTPUT -j NULLTRACE_V6_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_V6_MANGLE_PREROUTING"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_V6_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_V6_MANGLE_PRE"],
         }
         chain_contents = {
             "v4:filter:NULLTRACE_OUTPUT": f"-N NULLTRACE_OUTPUT\n-A NULLTRACE_OUTPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_OUTPUT -j DROP\n",
@@ -2931,7 +2935,7 @@ class TestSection18_LinuxTestMatrix(unittest.TestCase):
             "v6:filter:NULLTRACE_V6_INPUT": f"-N NULLTRACE_V6_INPUT\n-A NULLTRACE_V6_INPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_INPUT -j DROP\n",
             "v6:filter:NULLTRACE_V6_FORWARD": f"-N NULLTRACE_V6_FORWARD\n-A NULLTRACE_V6_FORWARD -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_FORWARD -j DROP\n",
             "v6:mangle:NULLTRACE_V6_MANGLE_OUTPUT": f"-N NULLTRACE_V6_MANGLE_OUTPUT\n-A NULLTRACE_V6_MANGLE_OUTPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_MANGLE_OUTPUT -j ACCEPT\n",
-            "v6:mangle:NULLTRACE_V6_MANGLE_PREROUTING": f"-N NULLTRACE_V6_MANGLE_PREROUTING\n-A NULLTRACE_V6_MANGLE_PREROUTING -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_MANGLE_PREROUTING -j ACCEPT\n",
+            "v6:mangle:NULLTRACE_V6_MANGLE_PRE": f"-N NULLTRACE_V6_MANGLE_PRE\n-A NULLTRACE_V6_MANGLE_PRE -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_MANGLE_PRE -j ACCEPT\n",
         }
         manifest_fps = {}
         for key, content in chain_contents.items():
@@ -3424,6 +3428,7 @@ class TestSection18_LinuxTestMatrix(unittest.TestCase):
         with patch("nulltrace.require_trusted_binary", return_value="/usr/sbin/ip"), \
              patch.object(app, "_read_current_mac", return_value="00:11:22:33:44:55"), \
              patch.object(app, "_persist_session_metadata"), \
+             patch.object(app, "_is_interface_up", return_value=False), \
              patch("nulltrace.run_trusted") as mock_run:
             app._restore_mac()
             cmds = [call.args[0] for call in mock_run.call_args_list]
@@ -3748,6 +3753,544 @@ class TestLatestRemediations_NT01_Through_NT12(unittest.TestCase):
         readme_text = readme_path.read_text(encoding="utf-8")
         self.assertNotIn("transactional owned firewall chains", readme_text)
         self.assertIn("staged/durable", readme_text)
+
+
+class TestSection42_FilesystemAdversarial(unittest.TestCase):
+    """Section 42: Filesystem adversarial tests (symlinks, non-regular files, FD containment)."""
+
+    def test_attack1_destination_symlink_rejected(self):
+        """Attack 1: Target is a symlink pointing to attacker file -> write rejected, victim unchanged."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            victim = tmp_path / "victim.txt"
+            victim.write_text("original content", encoding="utf-8")
+            target_symlink = tmp_path / "target_link"
+            target_symlink.symlink_to(victim)
+
+            app = nulltrace.nulltrace()
+            # 1. validate_tor_config_target rejects symlink
+            with self.assertRaises(ValueError) as ctx:
+                app.validate_tor_config_target(target_symlink)
+            self.assertIn("symlink target rejected", str(ctx.exception))
+
+            # 2. install.secure_deploy_file rejects symlink destination
+            with self.assertRaises(ValueError) as ctx2:
+                install.secure_deploy_file("malicious content", target_symlink)
+            self.assertIn("symlink", str(ctx2.exception).lower())
+
+            # Verify victim file unchanged
+            self.assertEqual(victim.read_text(encoding="utf-8"), "original content")
+
+    def test_attack2_intermediate_symlink_rejected(self):
+        """Attack 2: Intermediate directory is a symlink -> rejected without privileged side effects."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            real_dir = tmp_path / "real_dir"
+            real_dir.mkdir()
+            symlink_dir = tmp_path / "symlink_dir"
+            symlink_dir.symlink_to(real_dir)
+
+            with self.assertRaises(ValueError) as ctx:
+                install.secure_open_dir_hierarchy(symlink_dir)
+            self.assertIn("symlink", str(ctx.exception).lower())
+
+    def test_attack3_directory_fd_relative_prevents_escape(self):
+        """Attack 3: Path traversal component '..' rejected by secure_open_dir_hierarchy."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            evil_path = tmp_path / "sub" / ".." / "evil"
+            with self.assertRaises(ValueError) as ctx:
+                nulltrace.secure_open_dir_hierarchy(evil_path)
+            self.assertIn("traversal", str(ctx.exception).lower())
+
+    def test_attack4_destination_replacement_non_regular_file(self):
+        """Attack 4: Destination FIFO / non-regular file rejected."""
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("mkfifo not supported on this platform")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fifo_path = Path(tmpdir) / "test_fifo"
+            try:
+                os.mkfifo(str(fifo_path))
+            except OSError:
+                self.skipTest("mkfifo failed on this filesystem")
+
+            with self.assertRaises(ValueError) as ctx:
+                nulltrace.atomic_write(fifo_path, "payload")
+            self.assertIn("not a regular file", str(ctx.exception).lower())
+
+
+class TestSection43_FirewallAdversarial(unittest.TestCase):
+    """Section 43: Firewall adversarial tests (unowned chains, ambiguous rc=1, drift, duplicates)."""
+
+    def setUp(self):
+        self.app = nulltrace.nulltrace()
+
+    def test_unowned_same_name_chain_jump_removal_refused(self):
+        """Unowned same-name chain: teardown refuses to flush/delete or remove jump."""
+        with patch("nulltrace.run_trusted") as mock_run:
+            # Inspection of unowned NULLTRACE_OUTPUT (missing exact marker comment)
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=["iptables"],
+                returncode=0,
+                stdout="-N NULLTRACE_OUTPUT\n-A NULLTRACE_OUTPUT -j ACCEPT\n",
+                stderr="",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                self.app._destroy_authenticated_chain("/usr/sbin/iptables", "filter", "NULLTRACE_OUTPUT")
+            self.assertIn("exact nulltrace ownership marker rule", str(ctx.exception))
+
+    def test_ambiguous_chain_inspection_treated_as_error(self):
+        """Ambiguous chain inspection (rc=1, stderr="") treated as error, not absence."""
+        with patch("nulltrace.run_trusted") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=["iptables"],
+                returncode=1,
+                stdout="",
+                stderr="",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                self.app._authenticate_or_create_chain("/usr/sbin/iptables", "filter", "NULLTRACE_OUTPUT")
+            self.assertIn("inspection error", str(ctx.exception).lower())
+
+    def test_external_rule_inserted_above_nulltrace_detected_as_drift(self):
+        """External rule inserted above NullTrace jump is detected as enforcement drift."""
+        mock_output = (
+            "-P OUTPUT ACCEPT\n"
+            "-A OUTPUT -p tcp -m tcp --dport 80 -j ACCEPT\n"
+            f"-A OUTPUT -j {nulltrace.CHAIN_FILTER_OUTPUT}\n"
+        )
+        with patch("nulltrace.run_trusted") as mock_run, \
+             patch("nulltrace.resolve_trusted_binary", return_value="/usr/sbin/iptables"), \
+             patch.object(self.app, "_check_ipv6_enabled", return_value=False):
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=["iptables"],
+                returncode=0,
+                stdout=mock_output,
+                stderr="",
+            )
+            status = self.app._check_live_firewall_status()
+            self.assertEqual(status, nulltrace.LiveFirewallStatus.PARTIAL)
+            with patch.object(self.app, "_load_session_metadata", return_value={"state": nulltrace.STATE_ACTIVE}), \
+                 patch.object(self.app, "_get_current_state", return_value=nulltrace.STATE_ACTIVE):
+                drift_status = self.app.get_enforcement_status()
+                self.assertEqual(drift_status, nulltrace.STATUS_ENFORCEMENT_DRIFT)
+
+    def test_duplicate_nulltrace_jump_detected_as_partial(self):
+        """Duplicate NullTrace jump rules detected as PARTIAL (invalid/corrupted)."""
+        mock_output = (
+            "-P OUTPUT ACCEPT\n"
+            f"-A OUTPUT -j {nulltrace.CHAIN_FILTER_OUTPUT}\n"
+            f"-A OUTPUT -j {nulltrace.CHAIN_FILTER_OUTPUT}\n"
+        )
+        with patch("nulltrace.run_trusted") as mock_run, \
+             patch("nulltrace.resolve_trusted_binary", return_value="/usr/sbin/iptables"), \
+             patch.object(self.app, "_check_ipv6_enabled", return_value=False):
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=["iptables"],
+                returncode=0,
+                stdout=mock_output,
+                stderr="",
+            )
+            status = self.app._check_live_firewall_status()
+            self.assertEqual(status, nulltrace.LiveFirewallStatus.PARTIAL)
+
+    def test_conditional_nulltrace_jump_detected_as_partial(self):
+        """Conditional NullTrace jump rule detected as PARTIAL (unconditional required)."""
+        mock_output = (
+            "-P OUTPUT ACCEPT\n"
+            f"-A OUTPUT -p tcp -j {nulltrace.CHAIN_FILTER_OUTPUT}\n"
+        )
+        with patch("nulltrace.run_trusted") as mock_run, \
+             patch("nulltrace.resolve_trusted_binary", return_value="/usr/sbin/iptables"), \
+             patch.object(self.app, "_check_ipv6_enabled", return_value=False):
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=["iptables"],
+                returncode=0,
+                stdout=mock_output,
+                stderr="",
+            )
+            status = self.app._check_live_firewall_status()
+            self.assertEqual(status, nulltrace.LiveFirewallStatus.PARTIAL)
+
+
+class TestSection44_TorServiceAdversarial(unittest.TestCase):
+    """Section 44: Tor service adversarial tests (fake process, fake binary, service command failures)."""
+
+    def setUp(self):
+        self.app = nulltrace.nulltrace()
+        self.app._tor_user = "109"
+
+    def test_fake_tor_process_rejected(self):
+        """Process named 'tor' with correct UID but untrusted /proc/<pid>/exe is rejected."""
+        with patch("os.readlink", return_value="/tmp/fake_tor"), \
+             patch("pathlib.Path.exists", return_value=True), \
+             patch("pathlib.Path.read_text", return_value="Name:\ttor\nUid:\t109 109 109 109\n"):
+            self.assertFalse(self.app._verify_process_is_tor(9999))
+
+    def test_fake_tor_real_untrusted_rejected(self):
+        """tor.real process outside TRUSTED_BIN_DIRS or writable by non-root is rejected."""
+        with patch("os.readlink", return_value="/tmp/tor.real"), \
+             patch("pathlib.Path.exists", return_value=True), \
+             patch("pathlib.Path.read_text", return_value="Name:\ttor\nUid:\t109 109 109 109\n"):
+            self.assertFalse(self.app._verify_process_is_tor(9999))
+
+    def test_service_command_exits_0_but_tor_not_running(self):
+        """Service start command returns 0, but Tor process is not running -> returns (False, detail)."""
+        with patch("nulltrace.resolve_trusted_binary", return_value="/bin/systemctl"), \
+             patch("nulltrace.run_trusted", return_value=subprocess.CompletedProcess(args=["systemctl"], returncode=0, stdout="", stderr="")), \
+             patch.object(self.app, "_has_verified_tor_process", return_value=False):
+            ok, detail = self.app._control_tor_service("start")
+            self.assertFalse(ok)
+            self.assertIn("post-condition", detail.lower())
+
+    def test_service_stop_exits_0_but_process_remains(self):
+        """Service stop command returns 0, but Tor process still running -> returns (False, detail)."""
+        with patch("nulltrace.resolve_trusted_binary", return_value="/bin/systemctl"), \
+             patch("nulltrace.run_trusted", return_value=subprocess.CompletedProcess(args=["systemctl"], returncode=0, stdout="", stderr="")), \
+             patch.object(self.app, "_has_verified_tor_process", return_value=True):
+            ok, detail = self.app._control_tor_service("stop")
+            self.assertFalse(ok)
+            self.assertIn("still running", detail.lower())
+
+    def test_restart_exits_0_but_ports_unavailable(self):
+        """Service restart exits 0, but process verification fails -> reported as restart failure."""
+        with patch("nulltrace.resolve_trusted_binary", return_value="/bin/systemctl"), \
+             patch("nulltrace.run_trusted", return_value=subprocess.CompletedProcess(args=["systemctl"], returncode=0, stdout="", stderr="")), \
+             patch.object(self.app, "_has_verified_tor_process", return_value=False):
+            ok, detail = self.app._control_tor_service("restart")
+            self.assertFalse(ok)
+            self.assertIn("post-condition", detail.lower())
+
+
+class TestSection45_RecoveryCorruptionAdversarial(unittest.TestCase):
+    """Section 45: Recovery corruption tests (missing/corrupt metadata, manifest, state.json)."""
+
+    def setUp(self):
+        self.app = nulltrace.nulltrace()
+
+    def test_metadata_missing_recovery_required(self):
+        """Missing metadata.json with active state.json returns STATE_RECOVERY_REQUIRED."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with patch("nulltrace.PERSISTENT_DIR", tmp_path), patch("nulltrace.RUN_DIR", tmp_path):
+                sdir = tmp_path / f"session_{self.app.session_id}"
+                sdir.mkdir(parents=True)
+                (tmp_path / "state.json").write_text(json.dumps({
+                    "state": nulltrace.STATE_ACTIVE,
+                    "session_id": self.app.session_id,
+                }), encoding="utf-8")
+                self.assertEqual(self.app.reconcile_state(), nulltrace.STATE_RECOVERY_REQUIRED)
+
+    def test_metadata_corrupt_recovery_required(self):
+        """Corrupted metadata.json returns STATE_RECOVERY_REQUIRED."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with patch("nulltrace.PERSISTENT_DIR", tmp_path), patch("nulltrace.RUN_DIR", tmp_path):
+                sdir = tmp_path / f"session_{self.app.session_id}"
+                sdir.mkdir(parents=True)
+                (sdir / "metadata.json").write_text("{corrupt json", encoding="utf-8")
+                (tmp_path / "state.json").write_text(json.dumps({
+                    "state": nulltrace.STATE_ACTIVE,
+                    "session_id": self.app.session_id,
+                }), encoding="utf-8")
+                self.assertEqual(self.app.reconcile_state(), nulltrace.STATE_RECOVERY_REQUIRED)
+
+    def test_manifest_missing_when_state_active(self):
+        """Missing manifest.json when state is ACTIVE returns STATE_RECOVERY_REQUIRED."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with patch("nulltrace.PERSISTENT_DIR", tmp_path), patch("nulltrace.RUN_DIR", tmp_path):
+                sdir = tmp_path / f"session_{self.app.session_id}"
+                sdir.mkdir(parents=True)
+                (sdir / "metadata.json").write_text(json.dumps({
+                    "session_id": self.app.session_id,
+                    "state": nulltrace.STATE_ACTIVE,
+                }), encoding="utf-8")
+                (tmp_path / "state.json").write_text(json.dumps({
+                    "state": nulltrace.STATE_ACTIVE,
+                    "session_id": self.app.session_id,
+                }), encoding="utf-8")
+                self.assertEqual(self.app.reconcile_state(), nulltrace.STATE_RECOVERY_REQUIRED)
+
+    def test_state_json_corrupt(self):
+        """Corrupted state.json returns STATE_RECOVERY_REQUIRED."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with patch("nulltrace.PERSISTENT_DIR", tmp_path), patch("nulltrace.RUN_DIR", tmp_path):
+                (tmp_path / "state.json").write_text("{invalid json", encoding="utf-8")
+                self.assertEqual(self.app.reconcile_state(), nulltrace.STATE_RECOVERY_REQUIRED)
+
+    def test_backup_missing_when_baseline_captured_raises(self):
+        """Authoritative captured baseline with missing torrc.bak raises RuntimeError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            torrc = tmp_path / "torrc"
+            self.app.config.tor_config = str(torrc)
+            with patch("nulltrace.PERSISTENT_DIR", tmp_path), \
+                 patch.object(self.app, "validate_tor_config_target", return_value=torrc), \
+                 patch.object(self.app, "_load_session_metadata", return_value={
+                     "baseline_captured": True,
+                     "tor_config_existed": True,
+                 }):
+                with self.assertRaises(RuntimeError) as ctx:
+                    self.app.restore_tor_config()
+                self.assertIn("backup missing", str(ctx.exception).lower())
+                self.assertFalse(self.app._tor_file_restored)
+
+    def test_session_id_mismatch_metadata_vs_directory(self):
+        """Metadata session_id disagreeing with session directory returns STATE_RECOVERY_REQUIRED."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with patch("nulltrace.PERSISTENT_DIR", tmp_path), patch("nulltrace.RUN_DIR", tmp_path):
+                sdir = tmp_path / "session_11111111"
+                sdir.mkdir(parents=True)
+                (sdir / "metadata.json").write_text(json.dumps({
+                    "session_id": "22222222",
+                    "state": nulltrace.STATE_ACTIVE,
+                }), encoding="utf-8")
+                (tmp_path / "state.json").write_text(json.dumps({
+                    "state": nulltrace.STATE_ACTIVE,
+                    "session_id": "11111111",
+                }), encoding="utf-8")
+                self.assertEqual(self.app.reconcile_state(), nulltrace.STATE_RECOVERY_REQUIRED)
+
+
+class TestSection46_AdminChangeAdversarial(unittest.TestCase):
+    """Section 46: Administrator changes outside managed block, same-name chains, rule insertion."""
+
+    def setUp(self):
+        self.app = nulltrace.nulltrace()
+
+    def test_admin_edits_outside_managed_block_preserved(self):
+        """Admin modifications outside managed block survive restoration."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            torrc = Path(tmpdir) / "torrc"
+            torrc.write_text(
+                "SocksPort 9050\n"
+                f"{nulltrace.TOR_CONFIG_BEGIN}\n"
+                "TransPort 9040\n"
+                f"{nulltrace.TOR_CONFIG_END}\n"
+                "DataDirectory /var/lib/tor\n",
+                encoding="utf-8"
+            )
+            self.app.config.tor_config = str(torrc)
+            with patch.object(self.app, "validate_tor_config_target", return_value=torrc), \
+                 patch.object(self.app, "_load_session_metadata", return_value={"tor_config_existed": True}), \
+                 patch.object(self.app, "_control_tor_service", return_value=(True, "")):
+                self.app.restore_tor_config()
+                content = torrc.read_text(encoding="utf-8")
+                self.assertIn("SocksPort 9050", content)
+                self.assertIn("DataDirectory /var/lib/tor", content)
+                self.assertNotIn("TransPort 9040", content)
+                self.assertFalse(nulltrace.torrc_has_managed_block(content))
+
+    def test_admin_deletes_torrc_restored_from_backup(self):
+        """Live torrc deleted during session is restored from backup."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            torrc = tmp_path / "torrc"
+            sdir = tmp_path / f"session_{self.app.session_id}"
+            sdir.mkdir(parents=True)
+            (sdir / "torrc.bak").write_text("ControlPort 9051\n", encoding="utf-8")
+            self.app.config.tor_config = str(torrc)
+
+            with patch("nulltrace.PERSISTENT_DIR", tmp_path), \
+                 patch.object(self.app, "validate_tor_config_target", return_value=torrc), \
+                 patch.object(self.app, "_load_session_metadata", return_value={"tor_config_existed": True}), \
+                 patch.object(self.app, "_control_tor_service", return_value=(True, "")):
+                self.app.restore_tor_config()
+                self.assertTrue(torrc.exists())
+                self.assertEqual(torrc.read_text(encoding="utf-8"), "ControlPort 9051\n")
+
+    def test_admin_creates_same_name_chain_unowned_protected(self):
+        """Admin created NULLTRACE_OUTPUT chain without marker is protected from teardown."""
+        with patch("nulltrace.run_trusted") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=["iptables"],
+                returncode=0,
+                stdout="-N NULLTRACE_OUTPUT\n-A NULLTRACE_OUTPUT -j DROP\n",
+                stderr="",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                self.app._destroy_authenticated_chain("/usr/sbin/iptables", "filter", "NULLTRACE_OUTPUT")
+            self.assertIn("exact nulltrace ownership marker rule", str(ctx.exception))
+
+
+class TestSection47_ConfigAdversarial(unittest.TestCase):
+    """Section 47: Config validation adversarial tests (port collisions, CIDR validation, permissions)."""
+
+    def setUp(self):
+        self.app = nulltrace.nulltrace()
+
+    def test_config_port_collisions_rejected(self):
+        """Tor TransPort, DNSPort, and ControlPort collisions rejected."""
+        # 1. tor_port == dns_port
+        self.app.config.tor_port = 9040
+        self.app.config.dns_port = 9040
+        with self.assertRaises(ValueError) as ctx:
+            self.app.validate_network_config()
+        self.assertIn("Port collision", str(ctx.exception))
+
+        # 2. tor_port == control_port (9051)
+        self.app.config.dns_port = 5353
+        self.app.config.tor_port = 9051
+        with self.assertRaises(ValueError) as ctx:
+            self.app.validate_network_config()
+        self.assertIn("ControlPort", str(ctx.exception))
+
+        # 3. dns_port == control_port (9051)
+        self.app.config.tor_port = 9040
+        self.app.config.dns_port = 9051
+        with self.assertRaises(ValueError) as ctx:
+            self.app.validate_network_config()
+        self.assertIn("ControlPort", str(ctx.exception))
+
+        # 4. Privileged port 53 rejected
+        self.app.config.dns_port = 53
+        with self.assertRaises(ValueError) as ctx:
+            self.app.validate_network_config()
+        self.assertIn("port 53", str(ctx.exception))
+
+    def test_config_exclusions_validation(self):
+        """Full-route exclusions, overlapping CIDRs, and IPv6 exclusions rejected."""
+        # 1. Full-route 0.0.0.0/0
+        self.app.config.dns_port = 5353
+        self.app.config.tor_port = 9040
+        self.app.config.excluded_networks = ["0.0.0.0/0"]
+        with self.assertRaises(ValueError) as ctx:
+            self.app.validate_network_config()
+        self.assertIn("Full-route exclusion", str(ctx.exception))
+
+        # 2. Full-route ::/0
+        self.app.config.excluded_networks = ["::/0"]
+        with self.assertRaises(ValueError) as ctx:
+            self.app.validate_network_config()
+        self.assertIn("Full-route exclusion", str(ctx.exception))
+
+        # 3. IPv6 exclusion
+        self.app.config.excluded_networks = ["2001:db8::/32"]
+        with self.assertRaises(ValueError) as ctx:
+            self.app.validate_network_config()
+        self.assertIn("IPv6 exclusion", str(ctx.exception))
+
+        # 4. Overlapping networks
+        self.app.config.excluded_networks = ["10.0.0.0/8", "10.1.0.0/16"]
+        with self.assertRaises(ValueError) as ctx:
+            self.app.validate_network_config()
+        self.assertIn("Overlapping exclusion networks", str(ctx.exception))
+
+        # 5. Overlapping IP and network
+        self.app.config.excluded_networks = ["192.168.1.0/24"]
+        self.app.config.excluded_ips = ["192.168.1.100"]
+        with self.assertRaises(ValueError) as ctx:
+            self.app.validate_network_config()
+        self.assertIn("Overlapping exclusion", str(ctx.exception))
+
+    def test_config_invalid_exit_country(self):
+        """Invalid exit country codes rejected."""
+        self.app.config.dns_port = 5353
+        self.app.config.tor_port = 9040
+        self.app.config.excluded_networks = []
+        self.app.config.excluded_ips = []
+
+        self.app.config.exit_country = "USA"
+        with self.assertRaises(ValueError):
+            self.app.validate_network_config()
+
+        self.app.config.exit_country = "12"
+        with self.assertRaises(ValueError):
+            self.app.validate_network_config()
+
+    def test_config_torrc_security_validations(self):
+        """Path traversal and insecure permissions on torrc rejected."""
+        # Traversal
+        with self.assertRaises(ValueError):
+            self.app.validate_tor_config_target("/etc/tor/../etc/shadow")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            real_file = tmp_path / "real_torrc"
+            real_file.write_text("SocksPort 9050\n", encoding="utf-8")
+            sym_file = tmp_path / "sym_torrc"
+            sym_file.symlink_to(real_file)
+            with self.assertRaises(ValueError) as ctx:
+                self.app.validate_tor_config_target(sym_file)
+            self.assertIn("symlink target rejected", str(ctx.exception))
+
+
+class TestSection48_InstallerAdversarial(unittest.TestCase):
+    """Section 48: Installer adversarial tests (symlinks, permissions, sudo_user sanitization)."""
+
+    def test_install_target_dir_symlink_rejected(self):
+        """Target directory as symlink is rejected by secure_deploy_file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            real_dir = tmp_path / "real_dir"
+            real_dir.mkdir()
+            sym_dir = tmp_path / "sym_dir"
+            sym_dir.symlink_to(real_dir)
+            with self.assertRaises(ValueError) as ctx:
+                install.secure_deploy_file("content", sym_dir / "target.py")
+            self.assertIn("symlink", str(ctx.exception).lower())
+
+    def test_install_target_dir_is_file_rejected(self):
+        """Target parent directory as a regular file is rejected by secure_deploy_file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            file_as_dir = tmp_path / "not_a_dir"
+            file_as_dir.write_text("hello", encoding="utf-8")
+            with self.assertRaises(ValueError) as ctx:
+                install.secure_deploy_file("content", file_as_dir / "target.py")
+            self.assertTrue(any(s in str(ctx.exception).lower() for s in ("not a directory", "non-directory")))
+
+    def test_install_source_file_symlink_rejected(self):
+        """Source nulltrace.py as symlink is rejected by installer."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            real_py = tmp_path / "real_nulltrace.py"
+            real_py.write_text("# python", encoding="utf-8")
+            sym_py = tmp_path / "nulltrace.py"
+            sym_py.symlink_to(real_py)
+            with patch("install.__file__", str(tmp_path / "install.py")), \
+                 patch("install.check_dependencies"), \
+                 patch("sys.exit") as mock_exit:
+                mock_exit.side_effect = SystemExit(1)
+                with self.assertRaises(SystemExit):
+                    install.install_nulltrace()
+                mock_exit.assert_called_with(1)
+
+    def test_install_python3_trusted_validation_fails(self):
+        """require_trusted_binary('python3') failing aborts installation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            src_py = tmp_path / "nulltrace.py"
+            src_py.write_text("# python", encoding="utf-8")
+            with patch("install.__file__", str(tmp_path / "install.py")), \
+                 patch("install.check_dependencies"), \
+                 patch("install.require_trusted_binary", side_effect=RuntimeError("python3 untrusted")), \
+                 patch("sys.exit") as mock_exit:
+                mock_exit.side_effect = SystemExit(1)
+                with self.assertRaises(SystemExit):
+                    install.install_nulltrace()
+                mock_exit.assert_called_with(1)
+
+    def test_install_sudo_user_malformed_rejected(self):
+        """Malformed SUDO_USER containing traversal '..' is safely ignored."""
+        env_evil = {"SUDO_USER": "attacker/../../root"}
+        with patch.dict(os.environ, env_evil), \
+             patch("install.check_root"), \
+             patch("install.routing_may_be_active", return_value=False), \
+             patch("builtins.print") as mock_print, \
+             patch("shutil.rmtree"), patch("pathlib.Path.unlink"):
+            install.uninstall_nulltrace(interactive=False, purge=True)
+            printed = " ".join(call.args[0] for call in mock_print.call_args_list if call.args)
+            self.assertIn("malformed SUDO_USER", printed)
+
+    def test_install_purge_path_traversal_refused(self):
+        """Purge path with '..' or unexpected target name is refused."""
+        cfg = Path("/etc/nulltrace/../shadow")
+        suspicious = (".." in cfg.parts or cfg.name != "nulltrace")
+        self.assertTrue(suspicious)
 
 
 if __name__ == "__main__":

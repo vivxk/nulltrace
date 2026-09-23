@@ -202,7 +202,7 @@ def resolve_trusted_binary(name: str) -> Optional[str]:
             continue
 
         # Must be root-owned on POSIX systems (P1-5)
-        if hasattr(target_st, "st_uid") and os.name != "nt":
+        if hasattr(target_st, "st_uid") and (os.name != "nt" or getattr(os, "_force_posix_security_checks", False)):
             if target_st.st_uid != 0:
                 continue
 
@@ -293,6 +293,107 @@ def run_trusted(
     )
 
 
+def secure_open_dir_hierarchy(
+    dir_path: Union[str, Path],
+    target_uid: Optional[int] = None,
+    target_gid: Optional[int] = None,
+) -> Optional[int]:
+    """
+    Securely opens a directory hierarchy component-by-component on POSIX/Linux (P0-1, P0-2, P2.1, NT-015).
+    Guarantees:
+    - Never follows symbolic links at any intermediate or trailing level (using O_DIRECTORY | O_NOFOLLOW at each step).
+    - Checks fstat() on every intermediate directory descriptor for directory type.
+    - Rejects world-writable directories without sticky bit.
+    - When running as root, verifies root ownership (or allowed target_uid) on every component.
+    - Returns an open file descriptor bound to the target directory on Linux, or None on Windows.
+    - If any component is a symlink or insecure, raises ValueError and closes open descriptors.
+    """
+    p = Path(dir_path)
+    if not p.is_absolute():
+        p = Path.cwd() / p
+
+    parts = p.parts
+    if not parts:
+        raise ValueError("Invalid empty path")
+    if os.name != "nt" and parts[0] != "/":
+        raise ValueError(f"Directory path '{dir_path}' must be an absolute path starting with '/' on POSIX")
+
+    has_dir_fd_open = (
+        hasattr(os, "supports_dir_fd")
+        and os.open in getattr(os, "supports_dir_fd", set())
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+    )
+    if os.name == "nt" or not has_dir_fd_open:
+        # Cross-platform / Windows test runner fallback
+        curr = Path(parts[0])
+        for comp in parts[1:]:
+            curr = curr / comp
+            if curr.exists() or os.path.islink(str(curr)):
+                st = os.lstat(str(curr))
+                if stat.S_ISLNK(st.st_mode):
+                    raise ValueError(f"Security violation: path component '{comp}' in '{dir_path}' is a symlink; refusing privileged access.")
+                if not stat.S_ISDIR(st.st_mode):
+                    raise ValueError(f"Path component '{comp}' in '{dir_path}' is not a directory.")
+                if os.name != "nt" or getattr(os, "_force_posix_security_checks", False):
+                    if (st.st_mode & 0o002) and not (st.st_mode & stat.S_ISVTX):
+                        raise ValueError(f"Security violation: insecure permissions ({oct(st.st_mode)}); directory component '{comp}' in '{dir_path}' is world-writable without sticky bit.")
+                    if hasattr(os, "geteuid") and os.geteuid() == 0:
+                        if (st.st_mode & 0o020) and not (st.st_mode & stat.S_ISVTX):
+                            if st.st_gid != 0 and (target_gid is None or st.st_gid != target_gid):
+                                raise ValueError(f"Security violation: insecure permissions ({oct(st.st_mode)}); directory component '{comp}' in '{dir_path}' is group-writable by non-root group ({st.st_gid}).")
+                        if st.st_uid != 0 and (target_uid is None or st.st_uid != target_uid):
+                            raise ValueError(f"Security violation: directory component '{comp}' in '{dir_path}' is owned by UID {st.st_uid}, expected root (UID 0).")
+        return None
+
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY
+    curr_fd = os.open("/", dir_flags)
+    try:
+        for comp in parts[1:]:
+            comp_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            try:
+                next_fd = os.open(comp, comp_flags, dir_fd=curr_fd)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise ValueError(
+                        f"Security violation: path component '{comp}' in '{dir_path}' is a symlink or non-directory; refusing privileged access."
+                    ) from exc
+                raise ValueError(
+                    f"Failed to securely open path component '{comp}' in '{dir_path}': {exc}"
+                ) from exc
+
+            os.close(curr_fd)
+            curr_fd = next_fd
+
+            st = os.fstat(curr_fd)
+            if not stat.S_ISDIR(st.st_mode):
+                raise ValueError(f"Path component '{comp}' in '{dir_path}' is not a directory.")
+
+            if (st.st_mode & 0o002) and not (st.st_mode & stat.S_ISVTX):
+                raise ValueError(
+                    f"Security violation: insecure permissions ({oct(st.st_mode)}); directory component '{comp}' in '{dir_path}' is world-writable without sticky bit."
+                )
+
+            if hasattr(os, "geteuid") and os.geteuid() == 0 and (os.name != "nt" or getattr(os, "_force_posix_security_checks", False)):
+                if (st.st_mode & 0o020) and not (st.st_mode & stat.S_ISVTX):
+                    if st.st_gid != 0 and (target_gid is None or st.st_gid != target_gid):
+                        raise ValueError(
+                            f"Security violation: insecure permissions ({oct(st.st_mode)}); directory component '{comp}' in '{dir_path}' is group-writable by non-root group ({st.st_gid})."
+                        )
+                if st.st_uid != 0 and (target_uid is None or st.st_uid != target_uid):
+                    raise ValueError(
+                        f"Security violation: directory component '{comp}' in '{dir_path}' is owned by UID {st.st_uid}, expected root (UID 0)."
+                    )
+
+        return curr_fd
+    except Exception:
+        try:
+            os.close(curr_fd)
+        except OSError:
+            pass
+        raise
+
+
 def atomic_write(
     path: Union[str, Path],
     content: Union[str, bytes],
@@ -302,9 +403,10 @@ def atomic_write(
 ) -> None:
     """
     Race-resistant atomic durable write to path (P0-1, P2-4, NT-015, P1.1).
-    Validates parent directory security using file descriptors.
+    Validates parent directory security using file descriptors and component-by-component checks.
     Uses O_DIRECTORY | O_NOFOLLOW to open parent directory and validate permissions.
-    Performs creation, permissions, fsync, and replace relative to the parent directory.
+    Performs openat-style creation, permissions, metadata application, fsync, and renameat
+    relative to the opened parent directory file descriptor without pathname fallbacks on Linux.
     Treats security/durability failures (chmod, chown, fsync) as fatal.
     Rejects writing to symlinks, non-regular files, or insecure directories.
     """
@@ -314,6 +416,8 @@ def atomic_write(
         raise ValueError(f"Invalid destination filename '{path}'")
 
     parent_path = dest_path.parent
+    if not parent_path.is_absolute():
+        parent_path = Path.cwd() / parent_path
     parent_path.mkdir(parents=True, exist_ok=True)
 
     if os.path.islink(str(parent_path)):
@@ -321,38 +425,26 @@ def atomic_write(
     if os.path.islink(str(dest_path)):
         raise ValueError(f"Destination '{path}' is a symlink; refusing privileged write.")
 
-    dir_flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        dir_flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        dir_flags |= os.O_NOFOLLOW
-
     dir_fd: Optional[int] = None
     try:
-        if os.name != "nt":
-            try:
-                dir_fd = os.open(str(parent_path), dir_flags)
-            except OSError as exc:
-                raise ValueError(f"Failed to open parent directory '{parent_path}' securely: {exc}") from exc
-
+        dir_fd = secure_open_dir_hierarchy(parent_path, target_uid=uid, target_gid=gid)
         if dir_fd is not None:
             st_dir = os.fstat(dir_fd)
         else:
             st_dir = os.stat(str(parent_path))
+            if not stat.S_ISDIR(st_dir.st_mode):
+                raise ValueError(f"Parent '{parent_path}' is not a directory.")
 
-        if not stat.S_ISDIR(st_dir.st_mode):
-            raise ValueError(f"Parent '{parent_path}' is not a directory.")
-
-        # POSIX security checks for parent directory
-        if os.name != "nt" or getattr(os, "_force_posix_security_checks", False):
-            if st_dir.st_mode & 0o002:
-                raise ValueError(f"Directory '{parent_path}' is world-writable; refusing privileged write.")
-            if (st_dir.st_mode & 0o020) and hasattr(os, "geteuid") and os.geteuid() == 0:
-                if st_dir.st_gid != 0:
-                    raise ValueError(f"Directory '{parent_path}' is group-writable by non-root group ({st_dir.st_gid}); refusing privileged write.")
-            if hasattr(os, "geteuid") and os.geteuid() == 0:
-                if st_dir.st_uid != 0 and (uid is None or st_dir.st_uid != uid):
-                    raise ValueError(f"Directory '{parent_path}' is not owned by root or target uid (owner: {st_dir.st_uid}); refusing privileged write.")
+            # POSIX security checks for parent directory on Windows fallback / forced checks
+            if os.name != "nt" or getattr(os, "_force_posix_security_checks", False):
+                if st_dir.st_mode & 0o002:
+                    raise ValueError(f"Directory '{parent_path}' is world-writable; refusing privileged write.")
+                if (st_dir.st_mode & 0o020) and hasattr(os, "geteuid") and os.geteuid() == 0:
+                    if st_dir.st_gid != 0:
+                        raise ValueError(f"Directory '{parent_path}' is group-writable by non-root group ({st_dir.st_gid}); refusing privileged write.")
+                if hasattr(os, "geteuid") and os.geteuid() == 0:
+                    if st_dir.st_uid != 0 and (uid is None or st_dir.st_uid != uid):
+                        raise ValueError(f"Directory '{parent_path}' is not owned by root or target uid (owner: {st_dir.st_uid}); refusing privileged write.")
 
         orig_stat = None
         has_dir_fd_stat = dir_fd is not None and hasattr(os, "stat") and os.stat in getattr(os, "supports_dir_fd", set())
@@ -390,54 +482,78 @@ def atomic_write(
         else:
             target_mode = 0o600
 
-        is_text = isinstance(content, str)
-        prefix = f".{dest_name}.tmp_"
+        tmp_name = f".{dest_name}.tmp_{os.urandom(8).hex()}"
+        temp_path = parent_path / tmp_name
+        use_dir_fd = (dir_fd is not None and os.open in getattr(os, "supports_dir_fd", set()))
+        tmp_fd: Optional[int] = None
 
-        tf = tempfile.NamedTemporaryFile(
-            mode="w" if is_text else "wb",
-            dir=parent_path,
-            prefix=prefix,
-            delete=False,
-            encoding="utf-8" if is_text else None,
-        )
-        temp_path = Path(tf.name)
         try:
-            try:
-                tf.write(content)
-                tf.flush()
-                os.fsync(tf.fileno())
-                # Race-free permission & ownership setting via open fd
+            if use_dir_fd:
+                open_flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
+                if hasattr(os, "O_NOFOLLOW"):
+                    open_flags |= os.O_NOFOLLOW
+                if hasattr(os, "O_CLOEXEC"):
+                    open_flags |= os.O_CLOEXEC
+                tmp_fd = os.open(tmp_name, open_flags, target_mode, dir_fd=dir_fd)
+                payload = content.encode("utf-8") if isinstance(content, str) else content
+                written = 0
+                while written < len(payload):
+                    n = os.write(tmp_fd, payload[written:])
+                    if n == 0:
+                        raise OSError("Zero bytes written to temporary file")
+                    written += n
+
+                # Apply metadata directly to open file descriptor BEFORE fsync (P1/P2 durability)
                 if hasattr(os, "fchmod"):
-                    os.fchmod(tf.fileno(), target_mode)
+                    os.fchmod(tmp_fd, target_mode)
                 if (target_uid is not None or target_gid is not None) and hasattr(os, "fchown"):
                     if hasattr(os, "geteuid") and os.geteuid() == 0 and (os.name != "nt" or getattr(os, "_force_posix_security_checks", False)):
                         os.fchown(
-                            tf.fileno(),
+                            tmp_fd,
                             target_uid if target_uid is not None else -1,
                             target_gid if target_gid is not None else -1,
                         )
-            finally:
-                tf.close()
-        except Exception:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
 
-        try:
-            # Fallback chmod - fatal on failure (P2-4)
-            if not hasattr(os, "fchmod"):
-                os.chmod(temp_path, target_mode)
-
-            # Fallback ownership if requested - fatal on failure (P2-4)
-            if (target_uid is not None or target_gid is not None) and not hasattr(os, "fchown"):
-                if hasattr(os, "chown") and hasattr(os, "geteuid") and os.geteuid() == 0 and (os.name != "nt" or getattr(os, "_force_posix_security_checks", False)):
-                    os.chown(
-                        temp_path,
-                        target_uid if target_uid is not None else -1,
-                        target_gid if target_gid is not None else -1,
-                    )
+                # Durable sync of file content and metadata before rename
+                os.fsync(tmp_fd)
+                os.close(tmp_fd)
+                tmp_fd = None
+            else:
+                # Cross-platform / Windows fallback
+                is_text = isinstance(content, str)
+                tf = tempfile.NamedTemporaryFile(
+                    mode="w" if is_text else "wb",
+                    dir=parent_path,
+                    prefix=f".{dest_name}.tmp_",
+                    delete=False,
+                    encoding="utf-8" if is_text else None,
+                )
+                temp_path = Path(tf.name)
+                tmp_name = temp_path.name
+                try:
+                    tf.write(content)
+                    tf.flush()
+                    if hasattr(os, "fchmod"):
+                        os.fchmod(tf.fileno(), target_mode)
+                    if (target_uid is not None or target_gid is not None) and hasattr(os, "fchown"):
+                        if hasattr(os, "geteuid") and os.geteuid() == 0 and (os.name != "nt" or getattr(os, "_force_posix_security_checks", False)):
+                            os.fchown(
+                                tf.fileno(),
+                                target_uid if target_uid is not None else -1,
+                                target_gid if target_gid is not None else -1,
+                            )
+                    os.fsync(tf.fileno())
+                finally:
+                    tf.close()
+                if not hasattr(os, "fchmod"):
+                    os.chmod(temp_path, target_mode)
+                if (target_uid is not None or target_gid is not None) and not hasattr(os, "fchown"):
+                    if hasattr(os, "chown") and hasattr(os, "geteuid") and os.geteuid() == 0 and (os.name != "nt" or getattr(os, "_force_posix_security_checks", False)):
+                        os.chown(
+                            temp_path,
+                            target_uid if target_uid is not None else -1,
+                            target_gid if target_gid is not None else -1,
+                        )
 
             # Re-check destination in dir before replace to prevent race to symlink
             if os.path.islink(str(dest_path)):
@@ -467,25 +583,34 @@ def atomic_write(
                     if getattr(exc, "errno", None) != errno.ENOENT:
                         raise
 
-            # Perform atomic replacement
-            has_dir_fd_replace = dir_fd is not None and hasattr(os, "replace") and os.replace in getattr(os, "supports_dir_fd", set())
-            if has_dir_fd_replace:
-                os.replace(temp_path.name, dest_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            # Perform FD-relative atomic replacement without pathname fallbacks on Linux
+            if dir_fd is not None and os.rename in getattr(os, "supports_dir_fd", set()):
+                os.rename(tmp_name, dest_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            elif os.name != "nt":
+                raise RuntimeError("FD-relative rename is unsupported on this Linux environment; refusing unsafe fallback")
             else:
                 os.replace(temp_path, parent_path / dest_name)
 
             # Directory fsync - treat fatal errors as fatal (P2-4)
             if dir_fd is not None and hasattr(os, "fsync"):
-                try:
-                    os.fsync(dir_fd)
-                except OSError as exc:
-                    if exc.errno not in (errno.EINVAL, errno.EBADF, errno.EOPNOTSUPP, errno.ENOTTY):
-                        raise
+                os.fsync(dir_fd)
+
         except Exception:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            if tmp_fd is not None:
+                try:
+                    os.close(tmp_fd)
+                except OSError:
+                    pass
+            if use_dir_fd:
+                try:
+                    os.unlink(tmp_name, dir_fd=dir_fd)
+                except OSError:
+                    pass
+            else:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             raise
     finally:
         if dir_fd is not None:
@@ -1020,15 +1145,9 @@ class nulltrace:
         # POSIX security checks
         if os.name != "nt" or getattr(os, "_force_posix_security_checks", False):
             if lst.st_mode & 0o022:
-                try:
-                    os.chmod(d, lst.st_mode & ~0o022)
-                    lst = os.lstat(str(d))
-                except OSError:
-                    pass
-                if lst.st_mode & 0o022:
-                    raise RuntimeError(
-                        f"Security violation: directory '{d}' has insecure permissions ({oct(lst.st_mode)}); group or world writable."
-                    )
+                raise RuntimeError(
+                    f"Security violation: directory '{d}' has insecure permissions ({oct(lst.st_mode)}); group or world writable."
+                )
 
             if hasattr(os, "geteuid") and os.geteuid() == 0:
                 if lst.st_uid != 0:
@@ -1244,7 +1363,7 @@ class nulltrace:
             "enforcement_manifest": manifest,
             "tor_config_existed": getattr(self, "_tor_config_existed", True),
             "tor_service_initially_active": getattr(self, "_tor_initially_active", True),
-            "tor_service_initially_enabled": getattr(self, "_tor_initially_enabled", True),
+            "tor_service_initially_enabled": getattr(self, "_tor_initially_enabled", None),
             "interface_initially_up": getattr(self, "_interface_initially_up", True),
             "failures": getattr(self, "_restore_failures", []),
         }
@@ -1837,6 +1956,13 @@ class nulltrace:
                     expected_uid = pwd.getpwnam(self._tor_user).pw_uid
                 except Exception:
                     pass
+        if expected_uid is None:
+            try:
+                tor_u = self.tor_user
+                if tor_u and tor_u.isdigit():
+                    expected_uid = int(tor_u)
+            except Exception:
+                pass
 
         if expected_uid is not None:
             # Effective UID must strictly match expected Tor UID (P2-6)
@@ -1845,6 +1971,8 @@ class nulltrace:
             # Real UID must either match expected Tor UID or root (privilege drop service) (P2-6)
             if real_uid not in (expected_uid, 0):
                 return False
+        else:
+            return False
 
         # 2. Executable target check from /proc/<pid>/exe
         exe_file = proc_pid / "exe"
@@ -1906,12 +2034,18 @@ class nulltrace:
         return pids
 
     def _find_pid_by_socket_inode(self, inode: str) -> Optional[int]:
-        """Map socket inode to first verified Tor PID or first candidate PID (backwards-compat)."""
+        """
+        Map socket inode to verified Tor PID (P1-4, P2-5).
+        Never returns an unverified PID.
+        For shared socket ownership, requires all owning PIDs to be verified Tor.
+        """
         pids = self._find_pids_by_socket_inode(inode)
-        for pid in pids:
-            if self._verify_process_is_tor(pid):
-                return pid
-        return pids[0] if pids else None
+        if not pids:
+            return None
+        verified = [pid for pid in pids if self._verify_process_is_tor(pid)]
+        if not verified or len(verified) != len(pids):
+            return None
+        return verified[0]
 
     def _verify_listener_ownership(self, port: int, proto: str) -> bool:
         """
@@ -2203,7 +2337,7 @@ class nulltrace:
 
         # Restore original Tor service state (P1-10)
         tor_initially_active = meta.get("tor_service_initially_active", getattr(self, "_tor_initially_active", True))
-        tor_initially_enabled = meta.get("tor_service_initially_enabled", getattr(self, "_tor_initially_enabled", True))
+        tor_initially_enabled = meta.get("tor_service_initially_enabled", getattr(self, "_tor_initially_enabled", None))
 
         action = "restart" if tor_initially_active else "stop"
         ok, detail = self._control_tor_service(action)
@@ -2211,7 +2345,7 @@ class nulltrace:
             self._tor_service_restored = False
             raise RuntimeError(f"Tor configuration restored on disk, but Tor service {action} failed: {detail}")
 
-        if not tor_initially_enabled:
+        if tor_initially_enabled is False:
             self._control_tor_service("disable")
 
         self._tor_service_restored = True
@@ -2400,7 +2534,10 @@ class nulltrace:
             self._renew_dhcp(intf)
             time.sleep(4)
         except Exception as exc:
-            run_trusted([ip_bin, "link", "set", intf, "up"], check=False)
+            if getattr(self, "_interface_initially_up", True):
+                run_trusted([ip_bin, "link", "set", intf, "up"], check=False)
+            else:
+                run_trusted([ip_bin, "link", "set", intf, "down"], check=False)
             self._restore_mac()
             raise RuntimeError(f"Failed to randomize MAC on {intf}: {exc}. Reverted.") from exc
 
@@ -2707,7 +2844,7 @@ class nulltrace:
         run_trusted([ip6tables_bin, "-A", CHAIN_V6_FORWARD, "-j", "DROP"], check=True)
 
     def _activate_jump_rules(self) -> None:
-        """Atomically insert jumps to custom chains at top of base chains (NT-003, P1.8)."""
+        """Insert jumps to custom chains at top of base chains using staged/durable activation with crash recovery (NT-003, P1.8)."""
         iptables_bin = require_trusted_binary("iptables")
 
         # P1.8: No global conntrack -F flush. Unrelated connections remain unharmed.
@@ -2877,8 +3014,12 @@ class nulltrace:
             self._restore_failures = []
             self._set_state(STATE_INACTIVE)
 
-    def _check_tor_service_enabled(self) -> bool:
-        """Check if Tor service is initially enabled in systemd (P1-10)."""
+    def _check_tor_service_enabled(self) -> Optional[bool]:
+        """
+        Check if Tor service is initially enabled in systemd (P1-10).
+        Returns True (enabled), False (disabled), or None (unknown).
+        Never coerces unknown state to True.
+        """
         systemctl_bin = resolve_trusted_binary("systemctl")
         if systemctl_bin:
             checked_any = False
@@ -2896,7 +3037,7 @@ class nulltrace:
                     pass
             if checked_any:
                 return False
-        return True
+        return None
 
     def setup_network_rules(self) -> None:
         """

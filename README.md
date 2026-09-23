@@ -13,10 +13,10 @@ nulltrace routes system traffic through the Tor network on Linux using iptables 
 
 ## 🚀 Key Security Architecture
 
-### ✅ Transactional & Non-Destructive Firewall Architecture
+### ✅ Staged & Durable Firewall Architecture with Crash Recovery
 - **Owned & Authenticated Chains**: All nulltrace firewall rules reside inside owned chains (`NULLTRACE_OUTPUT`, `NULLTRACE_INPUT`, `NULLTRACE_FORWARD`, `NULLTRACE_NAT_OUTPUT`, `NULLTRACE_MANGLE_*`, and `NULLTRACE_V6_*`), each authenticated with exact ownership markers (`nulltrace-owned`) before mutation or reuse. Generic port matches or marks alone are never treated as ownership proofs.
-- **Atomic Activation & Host Coexistence**: Nulltrace never flushes host firewall tables (`iptables -F`) and preserves global connection tracking state (`conntrack -F`). Jump rules are inserted at priority 1 of base chains. Downstream chains managed by UFW, firewalld, Docker, VPNs, or administrator configurations remain present, though traffic matching position-1 intercept rules is evaluated first. On normal stop, owned jumps and chains are removed cleanly without overwriting the live firewall. Full table restore is available only via explicit `--destructive-restore`.
-- **Fail-Closed Rollback**: If any rule fails during startup or if the process receives SIGINT/SIGTERM, nulltrace triggers an immediate fail-closed rollback that removes jump rules, cleans custom chains, and reverts runtime state.
+- **Staged / Durable Activation & Host Coexistence**: Nulltrace never flushes host firewall tables (`iptables -F`) and preserves global connection tracking state (`conntrack -F`). Rules are pre-staged in custom chains, then durable priority-1 intercept jumps are installed into base chains with intermediate state checkpoints. Downstream chains managed by UFW, firewalld, Docker, VPNs, or administrator configurations remain present, though traffic matching position-1 intercept rules is evaluated first. On normal stop, owned jumps and chains are removed cleanly without overwriting the live firewall. Full table restore is available only via explicit `--destructive-restore`.
+- **Fail-Closed Rollback**: If any rule fails during startup or if the process receives SIGINT/SIGTERM, nulltrace triggers an immediate fail-closed rollback that removes jump rules, cleans custom chains, and reverts runtime state. Missing or interrupted activations are reconciled to `RECOVERY_REQUIRED`.
 
 ### ✅ Egress Lockdown, Masked Marks & Conntrack Isolation
 - **Connection Tracking & Namespaced Marks**: Pre-existing direct TCP connections cannot bypass Tor. Nulltrace isolates Tor daemon flows using a 16-bit masked CONNMARK (`0x4e540000/0xffff0000`), ensuring unrelated packet marks used by host VPNs, QoS, or policy routing survive unmolested.
@@ -40,7 +40,7 @@ nulltrace routes system traffic through the Tor network on Linux using iptables 
 - **Ownership-Aware Tor Configuration**: Baseline snapshot is taken once per session. On teardown, only the Nulltrace-managed block is stripped, preserving any concurrent administrator settings added outside the block.
 - **Explicit Lifecycle States**: Full state machine transitions through `INACTIVE` -> `PREPARING` -> `ACTIVE` -> `RESTORING` -> `INACTIVE`, `RESTORE_FAILED`, or `RECOVERY_REQUIRED`.
 - **Tri-State Teardown Verification**: Teardown verification distinguishes between clean removal (`VERIFIED_CLEAN`), remaining rules (`VERIFIED_DIRTY`), and inspection errors (`VERIFICATION_FAILED`). Recovery state is never deleted unless teardown is proven clean.
-- **Durable Atomic Writes & Symlink Containment**: All configuration, state, and backup files are written with 0600 mode using temporary files and atomic replacement. Path resolution strictly confines configuration to canonical `~/.config/nulltrace/`, rejecting symlinked directories, symlinked files, FIFOs, and devices.
+- **Race-Resistant FD-Relative Atomic Writes & Symlink Containment**: All configuration, state, and backup files are written with 0600 mode using genuinely race-resistant FD-relative operations on Linux (`openat` with `O_DIRECTORY | O_NOFOLLOW`, metadata applied to open descriptors before `fsync`, `os.rename(..., src_dir_fd=..., dst_dir_fd=...)`, and directory fsync). Fails closed if safe semantics cannot be guaranteed. Path resolution strictly confines configuration to canonical `~/.config/nulltrace/`, rejecting symlinked directories, symlinked files, FIFOs, and devices.
 - **Execution Hardening**: Privileged operations execute in a minimal sanitized environment (stripping `LD_*`, `PYTHON*`, `*PROXY*`, and `TMPDIR`) with trusted binary resolution.
 - **Deterministic Identity Rotation**: `--new-ip` requires definitive Tor ControlPort `SIGNAL NEWNYM` authentication and never falls back to `pkill -HUP`.
 - **Proxy-Safe IP Checks**: `--ip` status queries bypass ambient proxy variables and enforce strict type and address parsing for IPv4 and IPv6 exit nodes. Exit country codes require ASCII-only 2-letter ISO codes.
@@ -143,7 +143,7 @@ sudo nulltrace --start --circuit-time 1800
 |---|---|---|---|
 | `--start` | `-s` | Start Tor transparent proxying | `sudo nulltrace --start` |
 | `--stop` | `-x` | Teardown routing and restore system state | `sudo nulltrace --stop` |
-| `--destructive-restore` | | Allow destructive whole-table firewall snapshot restore on teardown failure | `sudo nulltrace --stop --destructive-restore` |
+| `--destructive-restore` | | Last-resort recovery option: restore whole-table snapshot if teardown fails (can overwrite concurrent firewall changes) | `sudo nulltrace --stop --destructive-restore` |
 | `--force-stop` | | Force teardown even if state file is inactive | `sudo nulltrace --force-stop` |
 | `--recover` | | Recover system state from persistent metadata & backups | `sudo nulltrace --recover` |
 | `--status` | | Display status and session diagnostics | `nulltrace --status` |
@@ -163,6 +163,12 @@ sudo nulltrace --start --circuit-time 1800
 ---
 
 ## 🛡️ Recovery & Troubleshooting
+
+### Destructive Restore Warning
+> [!WARNING]
+> **WARNING: This operation can overwrite firewall changes made after NullTrace activation.**
+>
+> `--destructive-restore` should only be used as an intentional, last-resort disaster recovery mechanism when normal teardown of owned custom chains fails and manual rule cleanup is not viable.
 
 ### Crash Recovery & `RESTORE_FAILED`
 If a stop operation is interrupted or encounters an error:

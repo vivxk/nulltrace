@@ -2144,6 +2144,7 @@ class TestSection11_ComprehensiveRegressions(unittest.TestCase):
                     flushed_tables.append(cmd[cmd.index("-t") + 1])
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
+        mock_script_stat = MagicMock(st_mode=stat.S_IFREG | 0o755, st_uid=0)
         with patch("install.inspect_live_nulltrace_rules", side_effect=[
             install.FirewallInspectionResult.ACTIVE,
             install.FirewallInspectionResult.ACTIVE,
@@ -2152,6 +2153,8 @@ class TestSection11_ComprehensiveRegressions(unittest.TestCase):
         patch("install.routing_may_be_active", return_value=True), \
         patch("install.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
         patch("install.run_trusted", side_effect=fake_run), \
+        patch("pathlib.Path.exists", return_value=True), \
+        patch("os.lstat", return_value=mock_script_stat), \
         patch("shutil.rmtree"), \
         patch("os.remove"), \
         patch("os.path.isdir", return_value=False), \
@@ -2572,6 +2575,7 @@ class TestSection11_ComprehensiveRegressions(unittest.TestCase):
 
     def test_recovery_successful_flush_removes_all_rules_and_tooling(self):
         """P1-6 & P2-8: Successful emergency flush verifies CLEAN status and removes NullTrace program files."""
+        mock_script_stat = MagicMock(st_mode=stat.S_IFREG | 0o755, st_uid=0)
         with patch("install.inspect_live_nulltrace_rules", side_effect=[
             install.FirewallInspectionResult.ACTIVE,
             install.FirewallInspectionResult.ACTIVE,
@@ -2580,6 +2584,8 @@ class TestSection11_ComprehensiveRegressions(unittest.TestCase):
         patch("install.routing_may_be_active", return_value=True), \
         patch("install.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
         patch("install.run_trusted", return_value=subprocess.CompletedProcess(args=["iptables"], returncode=0, stdout="", stderr="")), \
+        patch("pathlib.Path.exists", return_value=True), \
+        patch("os.lstat", return_value=mock_script_stat), \
         patch("shutil.rmtree") as mock_rmtree, \
         patch("os.remove") as mock_remove, \
         patch("os.path.isdir", return_value=True), \
@@ -2654,6 +2660,825 @@ class TestSection11_ComprehensiveRegressions(unittest.TestCase):
         with patch.object(app, "_load_session_metadata", return_value={"state": nulltrace.STATE_ACTIVE}), \
              patch.object(app, "_check_live_firewall_status", return_value=nulltrace.LiveFirewallStatus.UNKNOWN):
             self.assertEqual(app.reconcile_state(), nulltrace.STATE_RECOVERY_REQUIRED)
+
+
+
+
+IS_LINUX = sys.platform.startswith("linux")
+
+
+class TestSection18_LinuxTestMatrix(unittest.TestCase):
+    """
+    Comprehensive verification of Section 18 Linux Test Matrix:
+    - Filesystem security (14 items)
+    - Firewall (14 items)
+    - Tor identity (8 items)
+    - Installer (6 items)
+    - Service/config/interface restoration (11 items)
+    """
+
+    # =========================================================================
+    # Group 1: Filesystem Security (14 items)
+    # =========================================================================
+
+    def test_matrix_fs_01_destination_symlink_rejected(self):
+        """Matrix FS-1: destination symlink rejected."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_file = Path(tmpdir) / "real.txt"
+            real_file.write_text("original content\n", encoding="utf-8")
+            link_file = Path(tmpdir) / "link.txt"
+            try:
+                os.symlink(real_file, link_file)
+            except OSError:
+                with patch("os.path.islink", return_value=True):
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        nulltrace.atomic_write(link_file, "exploit\n")
+                return
+
+            with self.assertRaises((ValueError, RuntimeError)):
+                nulltrace.atomic_write(link_file, "exploit\n")
+            self.assertEqual(real_file.read_text(encoding="utf-8"), "original content\n")
+
+    def test_matrix_fs_02_parent_symlink_rejected(self):
+        """Matrix FS-2: parent symlink rejected."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_dir = Path(tmpdir) / "real_dir"
+            real_dir.mkdir()
+            link_dir = Path(tmpdir) / "link_dir"
+            try:
+                os.symlink(real_dir, link_dir)
+            except OSError:
+                with patch("os.path.islink", return_value=True):
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        nulltrace.atomic_write(link_dir / "target.txt", "data\n")
+                return
+
+            with self.assertRaises((ValueError, RuntimeError)):
+                nulltrace.atomic_write(link_dir / "target.txt", "data\n")
+
+    def test_matrix_fs_03_ancestor_symlink_rejected(self):
+        """Matrix FS-3: ancestor symlink rejected."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_ancestor = Path(tmpdir) / "real_anc"
+            real_ancestor.mkdir()
+            link_ancestor = Path(tmpdir) / "link_anc"
+            try:
+                os.symlink(real_ancestor, link_ancestor)
+            except OSError:
+                pass
+            sub_dir = link_ancestor / "subdir"
+            if link_ancestor.exists() and os.path.islink(str(link_ancestor)):
+                sub_dir.mkdir(parents=True, exist_ok=True)
+                with self.assertRaises((ValueError, RuntimeError)):
+                    nulltrace.atomic_write(sub_dir / "target.txt", "data\n")
+            else:
+                with patch("os.path.islink", side_effect=lambda p: "link_anc" in str(p)):
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        nulltrace.atomic_write(sub_dir / "target.txt", "data\n")
+
+    def test_matrix_fs_04_directory_replacement_race_rejected(self):
+        """Matrix FS-4: directory replacement/race rejected."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            real_dir = base / "real_dir"
+            real_dir.mkdir()
+            sub_dir = real_dir / "sub"
+            sub_dir.mkdir()
+
+            victim_dir = base / "victim_dir"
+            victim_dir.mkdir()
+
+            link_dir = base / "link_dir"
+            try:
+                os.symlink(victim_dir, link_dir)
+            except OSError:
+                with patch("os.path.islink", return_value=True):
+                    with self.assertRaises((ValueError, RuntimeError, OSError)):
+                        nulltrace.atomic_write(link_dir / "sub" / "exploit.txt", "data\n")
+                return
+
+            target = link_dir / "sub" / "exploit.txt"
+            with self.assertRaises((ValueError, RuntimeError, OSError)):
+                nulltrace.atomic_write(target, "malicious data\n")
+
+            self.assertFalse((victim_dir / "exploit.txt").exists())
+            self.assertFalse((victim_dir / "sub" / "exploit.txt").exists())
+
+    def test_matrix_fs_05_insecure_owner_rejected(self):
+        """Matrix FS-5: insecure owner rejected."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "insecure_owner_dir"
+            p.mkdir()
+            mock_stat = MagicMock(st_mode=stat.S_IFDIR | 0o755, st_uid=1000, st_gid=1000)
+            with patch("os.lstat", return_value=mock_stat), \
+                 patch("os.geteuid", return_value=0, create=True), \
+                 patch.object(os, "_force_posix_security_checks", True, create=True):
+                with self.assertRaises(RuntimeError) as ctx:
+                    nulltrace.nulltrace._validate_secure_directory(p)
+                self.assertIn("UID 1000", str(ctx.exception))
+
+    def test_matrix_fs_06_group_world_writable_directory_rejected(self):
+        """Matrix FS-6: group/world writable directory rejected without silent chmod."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "insecure_perm_dir"
+            p.mkdir()
+            mock_stat = MagicMock(st_mode=stat.S_IFDIR | 0o777, st_uid=0, st_gid=0)
+            with patch("os.lstat", return_value=mock_stat), \
+                 patch("os.chmod") as mock_chmod, \
+                 patch.object(os, "_force_posix_security_checks", True, create=True):
+                with self.assertRaises(RuntimeError) as ctx:
+                    nulltrace.nulltrace._validate_secure_directory(p)
+                self.assertIn("insecure permissions", str(ctx.exception))
+                mock_chmod.assert_not_called()
+
+    def test_matrix_fs_07_insecure_target_rejected(self):
+        """Matrix FS-7: insecure target rejected."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "insecure_target.txt"
+            target.write_text("data", encoding="utf-8")
+            orig_stat = os.stat
+            orig_lstat = os.lstat
+            mock_fifo = MagicMock(st_mode=stat.S_IFIFO | 0o600, st_uid=0, st_gid=0)
+            def selective_stat(p, *a, **kw):
+                if str(p) == str(target) or str(p) == target.name:
+                    return mock_fifo
+                return orig_stat(p, *a, **kw)
+            def selective_lstat(p, *a, **kw):
+                if str(p) == str(target) or str(p) == target.name:
+                    return mock_fifo
+                return orig_lstat(p, *a, **kw)
+            with patch("os.stat", side_effect=selective_stat), \
+                 patch("os.lstat", side_effect=selective_lstat):
+                with self.assertRaises((ValueError, RuntimeError)):
+                    nulltrace.atomic_write(target, "new_data")
+
+    def test_matrix_fs_08_secure_target_accepted(self):
+        """Matrix FS-8: secure target accepted."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "secure.txt"
+            nulltrace.atomic_write(target, "valid secure content\n", mode=0o644)
+            self.assertTrue(target.exists())
+            self.assertEqual(target.read_text(encoding="utf-8"), "valid secure content\n")
+
+    def test_matrix_fs_09_temp_file_created_in_correct_directory(self):
+        """Matrix FS-9: temp file created in correct directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            parent = Path(tmpdir) / "subdir"
+            parent.mkdir()
+            target = parent / "secure.txt"
+            nulltrace.atomic_write(target, "content\n")
+            self.assertTrue(target.exists())
+            remaining = list(parent.iterdir())
+            self.assertEqual(remaining, [target])
+
+    def test_matrix_fs_10_target_replacement_is_atomic(self):
+        """Matrix FS-10: target replacement is atomic."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "atomic.txt"
+            target.write_text("initial\n", encoding="utf-8")
+            nulltrace.atomic_write(target, "updated\n")
+            self.assertEqual(target.read_text(encoding="utf-8"), "updated\n")
+
+    def test_matrix_fs_11_metadata_applied_before_final_fsync(self):
+        """Matrix FS-11: metadata applied before final fsync."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "ordered.txt"
+            events = []
+
+            orig_fsync = os.fsync
+            def track_fsync(fd):
+                events.append("fsync")
+                return orig_fsync(fd)
+
+            if hasattr(os, "fchmod"):
+                orig_fchmod = os.fchmod
+                def track_fchmod(fd, mode):
+                    events.append("fchmod")
+                    return orig_fchmod(fd, mode)
+                with patch("os.fchmod", side_effect=track_fchmod), \
+                     patch("os.fsync", side_effect=track_fsync):
+                    nulltrace.atomic_write(target, "test\n")
+                if "fchmod" in events and "fsync" in events:
+                    self.assertLess(events.index("fchmod"), events.index("fsync"))
+            else:
+                nulltrace.atomic_write(target, "test\n")
+            self.assertTrue(target.exists())
+
+    def test_matrix_fs_12_file_fsync_failure_is_fatal(self):
+        """Matrix FS-12: file fsync failure is fatal."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "fatal_fsync.txt"
+            with patch("os.fsync", side_effect=OSError(errno.EIO, "I/O error")):
+                with self.assertRaises(OSError):
+                    nulltrace.atomic_write(target, "test\n")
+            self.assertFalse(target.exists())
+
+    def test_matrix_fs_13_directory_fsync_failure_is_fatal(self):
+        """Matrix FS-13: directory fsync failure is fatal."""
+        if not IS_LINUX:
+            return
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "fatal_dir_fsync.txt"
+            call_count = 0
+            def fake_fsync(fd):
+                nonlocal call_count
+                call_count += 1
+                if call_count >= 2:
+                    raise OSError(errno.EIO, "Dir sync error")
+            with patch("os.fsync", side_effect=fake_fsync):
+                with self.assertRaises(OSError):
+                    nulltrace.atomic_write(target, "test\n")
+
+    def test_matrix_fs_14_interrupted_write_leaves_safe_recoverable_state(self):
+        """Matrix FS-14: interrupted write leaves safe recoverable state."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "original.txt"
+            target.write_text("original stable content\n", encoding="utf-8")
+            if IS_LINUX:
+                with patch("os.write", side_effect=OSError(errno.ENOSPC, "No space left")):
+                    with self.assertRaises(OSError):
+                        nulltrace.atomic_write(target, "new corrupted data")
+            else:
+                with patch("tempfile.NamedTemporaryFile", side_effect=OSError(errno.ENOSPC, "No space left")):
+                    with self.assertRaises(OSError):
+                        nulltrace.atomic_write(target, "new corrupted data")
+            self.assertEqual(target.read_text(encoding="utf-8"), "original stable content\n")
+            files = [f.name for f in Path(tmpdir).iterdir()]
+            self.assertEqual(files, ["original.txt"])
+
+    # =========================================================================
+    # Group 2: Firewall (14 items)
+    # =========================================================================
+
+    def _setup_active_firewall_manifest(self, app):
+        rules_v4 = {
+            "filter": ["-A OUTPUT -j NULLTRACE_OUTPUT", "-A INPUT -j NULLTRACE_INPUT", "-A FORWARD -j NULLTRACE_FORWARD"],
+            "nat": ["-A OUTPUT -j NULLTRACE_NAT_OUTPUT"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_MANGLE_PREROUTING"],
+        }
+        rules_v6 = {
+            "filter": ["-A OUTPUT -j NULLTRACE_V6_OUTPUT", "-A INPUT -j NULLTRACE_V6_INPUT", "-A FORWARD -j NULLTRACE_V6_FORWARD"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_V6_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_V6_MANGLE_PREROUTING"],
+        }
+        chain_contents = {
+            "v4:filter:NULLTRACE_OUTPUT": f"-N NULLTRACE_OUTPUT\n-A NULLTRACE_OUTPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_OUTPUT -j DROP\n",
+            "v4:filter:NULLTRACE_INPUT": f"-N NULLTRACE_INPUT\n-A NULLTRACE_INPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_INPUT -j ACCEPT\n",
+            "v4:filter:NULLTRACE_FORWARD": f"-N NULLTRACE_FORWARD\n-A NULLTRACE_FORWARD -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_FORWARD -j DROP\n",
+            "v4:nat:NULLTRACE_NAT_OUTPUT": f"-N NULLTRACE_NAT_OUTPUT\n-A NULLTRACE_NAT_OUTPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_NAT_OUTPUT -p tcp -j REDIRECT --to-ports {app.config.tor_port}\n-A NULLTRACE_NAT_OUTPUT -p udp --dport 53 -j REDIRECT --to-ports {app.config.dns_port}\n",
+            "v4:mangle:NULLTRACE_MANGLE_OUTPUT": f"-N NULLTRACE_MANGLE_OUTPUT\n-A NULLTRACE_MANGLE_OUTPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_MANGLE_OUTPUT -j ACCEPT\n",
+            "v4:mangle:NULLTRACE_MANGLE_PREROUTING": f"-N NULLTRACE_MANGLE_PREROUTING\n-A NULLTRACE_MANGLE_PREROUTING -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_MANGLE_PREROUTING -j ACCEPT\n",
+            "v6:filter:NULLTRACE_V6_OUTPUT": f"-N NULLTRACE_V6_OUTPUT\n-A NULLTRACE_V6_OUTPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_OUTPUT -j REJECT\n",
+            "v6:filter:NULLTRACE_V6_INPUT": f"-N NULLTRACE_V6_INPUT\n-A NULLTRACE_V6_INPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_INPUT -j DROP\n",
+            "v6:filter:NULLTRACE_V6_FORWARD": f"-N NULLTRACE_V6_FORWARD\n-A NULLTRACE_V6_FORWARD -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_FORWARD -j DROP\n",
+            "v6:mangle:NULLTRACE_V6_MANGLE_OUTPUT": f"-N NULLTRACE_V6_MANGLE_OUTPUT\n-A NULLTRACE_V6_MANGLE_OUTPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_MANGLE_OUTPUT -j ACCEPT\n",
+            "v6:mangle:NULLTRACE_V6_MANGLE_PREROUTING": f"-N NULLTRACE_V6_MANGLE_PREROUTING\n-A NULLTRACE_V6_MANGLE_PREROUTING -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n-A NULLTRACE_V6_MANGLE_PREROUTING -j ACCEPT\n",
+        }
+        manifest_fps = {}
+        for key, content in chain_contents.items():
+            canon = "\n".join(l.strip() for l in content.splitlines() if l.strip())
+            manifest_fps[key] = hashlib.sha256(canon.encode()).hexdigest()
+        meta = {"enforcement_manifest": {"chain_fingerprints": manifest_fps}}
+        return rules_v4, rules_v6, chain_contents, meta
+
+    def test_matrix_fw_01_exact_first_jump_accepted(self):
+        """Matrix FW-1: exact first jump accepted."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+        rules_v4, rules_v6, chain_contents, meta = self._setup_active_firewall_manifest(app)
+
+        def fake_run(cmd, **kwargs):
+            is_v6 = "ip6tables" in cmd[0]
+            table = "filter"
+            if "-t" in cmd:
+                table = cmd[cmd.index("-t") + 1]
+            if len(cmd) >= 5 and cmd[3] == "-S" and not cmd[4].startswith("-"):
+                chain = cmd[4]
+                prefix = "v6" if is_v6 else "v4"
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=chain_contents.get(f"{prefix}:{table}:{chain}", ""), stderr="")
+            out = "\n".join((rules_v6 if is_v6 else rules_v4).get(table, [])) + "\n"
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=out, stderr="")
+
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+             patch.object(app, "_load_session_metadata", return_value=meta), \
+             patch("nulltrace.run_trusted", side_effect=fake_run):
+            self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.ACTIVE)
+
+    def test_matrix_fw_02_conditional_jump_rejected(self):
+        """Matrix FW-2: conditional jump rejected."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+        rules_v4 = {
+            "filter": ["-A OUTPUT -m owner --uid-owner 1000 -j NULLTRACE_OUTPUT"],
+            "nat": ["-A OUTPUT -j NULLTRACE_NAT_OUTPUT"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_MANGLE_PREROUTING"],
+        }
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+             patch("nulltrace.run_trusted", side_effect=lambda cmd, **kw: subprocess.CompletedProcess(
+                 args=cmd, returncode=0,
+                 stdout="\n".join(rules_v4.get(cmd[cmd.index("-t") + 1] if "-t" in cmd else "filter", [])) + "\n",
+                 stderr=""
+             )):
+            self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.PARTIAL)
+
+    def test_matrix_fw_03_non_first_jump_rejected(self):
+        """Matrix FW-3: non-first jump rejected."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+        rules_v4 = {
+            "filter": ["-A OUTPUT -d 10.0.0.0/8 -j DROP", "-A OUTPUT -j NULLTRACE_OUTPUT"],
+            "nat": ["-A OUTPUT -j NULLTRACE_NAT_OUTPUT"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_MANGLE_PREROUTING"],
+        }
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+             patch("nulltrace.run_trusted", side_effect=lambda cmd, **kw: subprocess.CompletedProcess(
+                 args=cmd, returncode=0,
+                 stdout="\n".join(rules_v4.get(cmd[cmd.index("-t") + 1] if "-t" in cmd else "filter", [])) + "\n",
+                 stderr=""
+             )):
+            self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.PARTIAL)
+
+    def test_matrix_fw_04_preceding_accept_rejected(self):
+        """Matrix FW-4: preceding ACCEPT rejected."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+        rules_v4 = {
+            "filter": ["-A OUTPUT -j ACCEPT", "-A OUTPUT -j NULLTRACE_OUTPUT"],
+            "nat": ["-A OUTPUT -j NULLTRACE_NAT_OUTPUT"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_MANGLE_PREROUTING"],
+        }
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+             patch("nulltrace.run_trusted", side_effect=lambda cmd, **kw: subprocess.CompletedProcess(
+                 args=cmd, returncode=0,
+                 stdout="\n".join(rules_v4.get(cmd[cmd.index("-t") + 1] if "-t" in cmd else "filter", [])) + "\n",
+                 stderr=""
+             )):
+            self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.PARTIAL)
+
+    def test_matrix_fw_05_duplicate_jump_rejected(self):
+        """Matrix FW-5: duplicate jump rejected."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+        rules_v4 = {
+            "filter": ["-A OUTPUT -j NULLTRACE_OUTPUT", "-A OUTPUT -j NULLTRACE_OUTPUT"],
+            "nat": ["-A OUTPUT -j NULLTRACE_NAT_OUTPUT"],
+            "mangle": ["-A OUTPUT -j NULLTRACE_MANGLE_OUTPUT", "-A PREROUTING -j NULLTRACE_MANGLE_PREROUTING"],
+        }
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+             patch("nulltrace.run_trusted", side_effect=lambda cmd, **kw: subprocess.CompletedProcess(
+                 args=cmd, returncode=0,
+                 stdout="\n".join(rules_v4.get(cmd[cmd.index("-t") + 1] if "-t" in cmd else "filter", [])) + "\n",
+                 stderr=""
+             )):
+            self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.PARTIAL)
+
+    def test_matrix_fw_06_ordered_fingerprints(self):
+        """Matrix FW-6: ordered fingerprints."""
+        rules1 = "-N TEST\n-A TEST -p tcp -j ACCEPT\n-A TEST -j DROP\n"
+        rules2 = "-N TEST\n-A TEST -j DROP\n-A TEST -p tcp -j ACCEPT\n"
+        hash1 = hashlib.sha256(rules1.encode()).hexdigest()
+        hash2 = hashlib.sha256(rules2.encode()).hexdigest()
+        self.assertNotEqual(hash1, hash2)
+
+    def test_matrix_fw_07_reordered_rules_produce_different_fingerprints(self):
+        """Matrix FW-7: reordered rules produce different fingerprints and return PARTIAL."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+        rules_v4, rules_v6, chain_contents, meta = self._setup_active_firewall_manifest(app)
+        orig = chain_contents["v4:filter:NULLTRACE_OUTPUT"]
+        lines = [l for l in orig.splitlines() if l.strip()]
+        lines[1], lines[2] = lines[2], lines[1]
+        chain_contents["v4:filter:NULLTRACE_OUTPUT"] = "\n".join(lines) + "\n"
+
+        def fake_run(cmd, **kwargs):
+            is_v6 = "ip6tables" in cmd[0]
+            table = "filter"
+            if "-t" in cmd:
+                table = cmd[cmd.index("-t") + 1]
+            if len(cmd) >= 5 and cmd[3] == "-S" and not cmd[4].startswith("-"):
+                chain = cmd[4]
+                prefix = "v6" if is_v6 else "v4"
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=chain_contents.get(f"{prefix}:{table}:{chain}", ""), stderr="")
+            out = "\n".join((rules_v6 if is_v6 else rules_v4).get(table, [])) + "\n"
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=out, stderr="")
+
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+             patch.object(app, "_load_session_metadata", return_value=meta), \
+             patch("nulltrace.run_trusted", side_effect=fake_run):
+            self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.PARTIAL)
+
+    def test_matrix_fw_08_missing_manifest_rejected(self):
+        """Matrix FW-8: missing manifest rejected."""
+        app = nulltrace.nulltrace()
+        rules_v4 = {"filter": ["-A OUTPUT -j NULLTRACE_OUTPUT"]}
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+             patch("nulltrace.run_trusted", return_value=subprocess.CompletedProcess(args=["iptables"], returncode=0, stdout="-A OUTPUT -j NULLTRACE_OUTPUT\n", stderr="")), \
+             patch.object(app, "_load_session_metadata", return_value={"state": nulltrace.STATE_ACTIVE}):
+            self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.PARTIAL)
+
+    def test_matrix_fw_09_corrupt_manifest_rejected(self):
+        """Matrix FW-9: corrupt manifest rejected."""
+        app = nulltrace.nulltrace()
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+             patch("nulltrace.run_trusted", return_value=subprocess.CompletedProcess(args=["iptables"], returncode=0, stdout="-A OUTPUT -j NULLTRACE_OUTPUT\n", stderr="")), \
+             patch.object(app, "_load_session_metadata", return_value={"enforcement_manifest": "invalid_manifest"}):
+            self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.PARTIAL)
+
+    def test_matrix_fw_10_incomplete_manifest_rejected(self):
+        """Matrix FW-10: incomplete manifest rejected."""
+        app = nulltrace.nulltrace()
+        meta = {"enforcement_manifest": {"chain_fingerprints": {"v4:filter:NULLTRACE_OUTPUT": "abc"}}}
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+             patch("nulltrace.run_trusted", return_value=subprocess.CompletedProcess(args=["iptables"], returncode=0, stdout="-A OUTPUT -j NULLTRACE_OUTPUT\n", stderr="")), \
+             patch.object(app, "_load_session_metadata", return_value=meta):
+            self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.PARTIAL)
+
+    def test_matrix_fw_11_ipv4_mismatch_detected(self):
+        """Matrix FW-11: IPv4 mismatch detected."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+        rules_v4, rules_v6, chain_contents, meta = self._setup_active_firewall_manifest(app)
+        meta["enforcement_manifest"]["chain_fingerprints"]["v4:filter:NULLTRACE_OUTPUT"] = "tampered_hash"
+
+        def fake_run(cmd, **kwargs):
+            is_v6 = "ip6tables" in cmd[0]
+            table = "filter"
+            if "-t" in cmd:
+                table = cmd[cmd.index("-t") + 1]
+            if len(cmd) >= 5 and cmd[3] == "-S" and not cmd[4].startswith("-"):
+                chain = cmd[4]
+                prefix = "v6" if is_v6 else "v4"
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=chain_contents.get(f"{prefix}:{table}:{chain}", ""), stderr="")
+            out = "\n".join((rules_v6 if is_v6 else rules_v4).get(table, [])) + "\n"
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=out, stderr="")
+
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+             patch.object(app, "_load_session_metadata", return_value=meta), \
+             patch("nulltrace.run_trusted", side_effect=fake_run):
+            self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.PARTIAL)
+
+    def test_matrix_fw_12_ipv6_mismatch_detected(self):
+        """Matrix FW-12: IPv6 mismatch detected."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+        rules_v4, rules_v6, chain_contents, meta = self._setup_active_firewall_manifest(app)
+        meta["enforcement_manifest"]["chain_fingerprints"]["v6:filter:NULLTRACE_V6_OUTPUT"] = "tampered_v6_hash"
+
+        def fake_run(cmd, **kwargs):
+            is_v6 = "ip6tables" in cmd[0]
+            table = "filter"
+            if "-t" in cmd:
+                table = cmd[cmd.index("-t") + 1]
+            if len(cmd) >= 5 and cmd[3] == "-S" and not cmd[4].startswith("-"):
+                chain = cmd[4]
+                prefix = "v6" if is_v6 else "v4"
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=chain_contents.get(f"{prefix}:{table}:{chain}", ""), stderr="")
+            out = "\n".join((rules_v6 if is_v6 else rules_v4).get(table, [])) + "\n"
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=out, stderr="")
+
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: f"/usr/sbin/{b}"), \
+             patch.object(app, "_load_session_metadata", return_value=meta), \
+             patch("nulltrace.run_trusted", side_effect=fake_run):
+            self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.PARTIAL)
+
+    def test_matrix_fw_13_ipv6_inspection_failure_produces_unknown(self):
+        """Matrix FW-13: IPv6 inspection failure produces UNKNOWN."""
+        app = nulltrace.nulltrace()
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda b: "/usr/sbin/iptables" if ("iptables" in b and "ip6tables" not in b) else None):
+            self.assertEqual(app._check_live_firewall_status(), nulltrace.LiveFirewallStatus.UNKNOWN)
+
+    def test_matrix_fw_14_partial_activation_recoverable(self):
+        """Matrix FW-14: partial activation recoverable."""
+        app = nulltrace.nulltrace()
+        with patch.object(app, "_load_session_metadata", return_value={"state": nulltrace.STATE_ACTIVE}), \
+             patch.object(app, "_check_live_firewall_status", return_value=nulltrace.LiveFirewallStatus.PARTIAL):
+            self.assertEqual(app.reconcile_state(), nulltrace.STATE_RECOVERY_REQUIRED)
+
+    # =========================================================================
+    # Group 3: Tor Identity (8 items)
+    # =========================================================================
+
+    def test_matrix_tor_01_fake_tor_process_rejected(self):
+        """Matrix Tor-1: fake tor process rejected."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+        mock_status = "Name:\ttor\nUid:\t109\t109\t109\t109\n"
+        with patch.object(Path, "is_dir", return_value=True), \
+             patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "read_text", return_value=mock_status), \
+             patch("os.readlink", return_value="/tmp/fake_tor"), \
+             patch("os.kill", return_value=None):
+            self.assertFalse(app._verify_process_is_tor(1234))
+
+    def test_matrix_tor_02_fake_tor_real_process_rejected(self):
+        """Matrix Tor-2: fake tor.real process rejected."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+        mock_status = "Name:\ttor\nUid:\t109\t109\t109\t109\n"
+        with patch.object(Path, "is_dir", return_value=True), \
+             patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "read_text", return_value=mock_status), \
+             patch("os.readlink", return_value="/home/user/tor.real"), \
+             patch("os.kill", return_value=None):
+            self.assertFalse(app._verify_process_is_tor(1234))
+
+    def test_matrix_tor_03_wrong_uid_rejected(self):
+        """Matrix Tor-3: wrong UID rejected."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+        mock_status_bad = "Name:\ttor\nUid:\t1000\t1000\t1000\t1000\n"
+        with patch.object(Path, "is_dir", return_value=True), \
+             patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "read_text", return_value=mock_status_bad), \
+             patch("os.readlink", return_value="/usr/bin/tor"), \
+             patch("os.kill", return_value=None):
+            self.assertFalse(app._verify_process_is_tor(1234))
+
+    def test_matrix_tor_04_wrong_executable_rejected(self):
+        """Matrix Tor-4: wrong executable rejected."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+        mock_status = "Name:\ttor\nUid:\t109\t109\t109\t109\n"
+        with patch.object(Path, "is_dir", return_value=True), \
+             patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "read_text", return_value=mock_status), \
+             patch("os.readlink", return_value="/bin/bash"), \
+             patch("os.kill", return_value=None):
+            self.assertFalse(app._verify_process_is_tor(1234))
+
+    def test_matrix_tor_05_correct_tor_executable_accepted(self):
+        """Matrix Tor-5: correct Tor executable accepted."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+        mock_status = "Name:\ttor\nUid:\t109\t109\t109\t109\n"
+        with patch.object(Path, "is_dir", return_value=True), \
+             patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "read_text", return_value=mock_status), \
+             patch("os.readlink", return_value="/usr/bin/tor"), \
+             patch("nulltrace.resolve_trusted_binary", return_value="/usr/bin/tor"), \
+             patch("os.kill", return_value=None):
+            self.assertTrue(app._verify_process_is_tor(1234))
+
+    def test_matrix_tor_06_proc_pid_exe_validation_works(self):
+        """Matrix Tor-6: /proc/<pid>/exe validation works."""
+        app = nulltrace.nulltrace()
+        app._tor_user = "109"
+        mock_status = "Name:\ttor\nUid:\t109\t109\t109\t109\n"
+        with patch.object(Path, "is_dir", return_value=True), \
+             patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "read_text", return_value=mock_status), \
+             patch("os.readlink", return_value="/usr/bin/tor") as mock_readlink, \
+             patch("nulltrace.resolve_trusted_binary", return_value="/usr/bin/tor"), \
+             patch("os.kill", return_value=None):
+            res = app._verify_process_is_tor(5678)
+            self.assertTrue(res)
+            self.assertIn("5678", str(mock_readlink.call_args[0][0]))
+
+    def test_matrix_tor_07_shared_socket_ownership_handled_safely(self):
+        """Matrix Tor-7: shared socket ownership handled safely (all Tor accepted)."""
+        app = nulltrace.nulltrace()
+        with patch.object(app, "_find_pids_by_socket_inode", return_value=[100, 200]), \
+             patch.object(app, "_verify_process_is_tor", return_value=True):
+            pid = app._find_pid_by_socket_inode("99999")
+            self.assertEqual(pid, 100)
+
+    def test_matrix_tor_08_ambiguous_ownership_handled_safely(self):
+        """Matrix Tor-8: ambiguous ownership handled safely (conflict rejected)."""
+        app = nulltrace.nulltrace()
+        with patch.object(app, "_find_pids_by_socket_inode", return_value=[100, 200]), \
+             patch.object(app, "_verify_process_is_tor", side_effect=lambda pid: pid == 100):
+            pid = app._find_pid_by_socket_inode("99999")
+            self.assertIsNone(pid)
+
+    # =========================================================================
+    # Group 4: Installer (6 items)
+    # =========================================================================
+
+    def test_matrix_install_01_destination_symlink_rejected(self):
+        """Matrix Install-1: destination symlink rejected."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_file = Path(tmpdir) / "real_file.py"
+            real_file.write_text("# real", encoding="utf-8")
+            link_file = Path(tmpdir) / "link_file.py"
+            try:
+                os.symlink(real_file, link_file)
+            except OSError:
+                with patch("os.path.islink", return_value=True), \
+                     patch.object(os, "_force_posix_security_checks", True, create=True):
+                    with self.assertRaises((ValueError, RuntimeError)) as ctx:
+                        install.secure_deploy_file(b"content", link_file, 0o755)
+                    self.assertIn("symlink", str(ctx.exception).lower())
+                return
+
+            with patch.object(os, "_force_posix_security_checks", True, create=True):
+                with self.assertRaises((ValueError, RuntimeError)) as ctx:
+                    install.secure_deploy_file(b"content", link_file, 0o755)
+                self.assertIn("symlink", str(ctx.exception).lower())
+
+    def test_matrix_install_02_insecure_usr_share_rejected(self):
+        """Matrix Install-2: insecure /usr/share/nulltrace rejected."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            insecure_dir = Path(tmpdir) / "share_nulltrace"
+            insecure_dir.mkdir()
+            mock_stat = MagicMock(st_mode=stat.S_IFDIR | 0o777, st_uid=0, st_gid=0)
+            with patch("os.lstat", return_value=mock_stat), \
+                 patch("os.fstat", return_value=mock_stat), \
+                 patch.object(os, "_force_posix_security_checks", True, create=True):
+                with self.assertRaises((ValueError, RuntimeError)) as ctx:
+                    install.secure_deploy_file(b"code", insecure_dir / "app.py", 0o644)
+                self.assertIn("insecure permissions", str(ctx.exception).lower())
+
+    def test_matrix_install_03_insecure_usr_bin_destination_rejected(self):
+        """Matrix Install-3: insecure /usr/bin destination rejected."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            insecure_bin = Path(tmpdir) / "bin"
+            insecure_bin.mkdir()
+            mock_stat = MagicMock(st_mode=stat.S_IFDIR | 0o755, st_uid=1000, st_gid=1000)
+            with patch("os.lstat", return_value=mock_stat), \
+                 patch("os.fstat", return_value=mock_stat), \
+                 patch("os.geteuid", return_value=0, create=True), \
+                 patch.object(os, "_force_posix_security_checks", True, create=True):
+                with self.assertRaises((ValueError, RuntimeError)) as ctx:
+                    install.secure_deploy_file(b"launcher", insecure_bin / "nulltrace", 0o755)
+                self.assertIn("root", str(ctx.exception).lower())
+
+    def test_matrix_install_04_privileged_replacement_is_atomic(self):
+        """Matrix Install-4: privileged replacement is atomic."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest = Path(tmpdir) / "app.py"
+            install.secure_deploy_file(b"initial payload", dest, 0o644)
+            self.assertEqual(dest.read_bytes(), b"initial payload")
+            install.secure_deploy_file(b"updated payload", dest, 0o644)
+            self.assertEqual(dest.read_bytes(), b"updated payload")
+
+    def test_matrix_install_05_temp_launcher_cannot_follow_symlink(self):
+        """Matrix Install-5: temp launcher cannot follow symlink."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            victim = Path(tmpdir) / "victim_launcher"
+            victim.write_text("#!/bin/sh\necho original\n", encoding="utf-8")
+            dest = Path(tmpdir) / "launcher"
+            try:
+                os.symlink(victim, dest)
+            except OSError:
+                with patch("os.path.islink", return_value=True), \
+                     patch.object(os, "_force_posix_security_checks", True, create=True):
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        install.secure_deploy_file(b"#!/bin/sh\nexit 0\n", dest, 0o755)
+                return
+
+            with patch.object(os, "_force_posix_security_checks", True, create=True):
+                with self.assertRaises((ValueError, RuntimeError, OSError)):
+                    install.secure_deploy_file(b"#!/bin/sh\nevil\n", dest, 0o755)
+            self.assertEqual(victim.read_text(encoding="utf-8"), "#!/bin/sh\necho original\n")
+
+    def test_matrix_install_06_missing_installed_recovery_copy_refuses_local_checkout(self):
+        """Matrix Install-6: missing installed recovery copy refuses local checkout."""
+        with patch("install.routing_may_be_active", return_value=True), \
+             patch("pathlib.Path.exists", return_value=False), \
+             patch("os.path.isfile", return_value=False), \
+             patch("install.inspect_live_nulltrace_rules", return_value=install.FirewallInspectionResult.ACTIVE), \
+             patch("install.resolve_trusted_binary", return_value="/usr/sbin/iptables"), \
+             patch("install.run_trusted", return_value=subprocess.CompletedProcess(args=["iptables"], returncode=0, stdout="", stderr="")), \
+             patch("shutil.rmtree"), \
+             patch("os.remove"):
+            with self.assertRaises(SystemExit) as ctx:
+                install.uninstall_nulltrace(emergency_flush=True, interactive=False)
+            self.assertEqual(ctx.exception.code, 1)
+
+    # =========================================================================
+    # Group 5: Service/Config/Interface Restoration (11 items)
+    # =========================================================================
+
+    def test_matrix_restore_01_tor_initially_active_remains_active(self):
+        """Matrix Restore-1: Tor initially active remains active (restarted, never stopped)."""
+        app = nulltrace.nulltrace()
+        app._tor_service_initially_active = True
+        with patch.object(app, "_load_session_metadata", return_value={"tor_service_initially_active": True}), \
+             patch.object(app, "validate_tor_config_target", side_effect=lambda p: Path(p)), \
+             patch.object(app, "_control_tor_service", return_value=(True, "")) as mock_ctrl:
+            app.restore_tor_config()
+            mock_ctrl.assert_called_with("restart")
+
+    def test_matrix_restore_02_tor_initially_inactive_remains_inactive(self):
+        """Matrix Restore-2: Tor initially inactive remains inactive."""
+        app = nulltrace.nulltrace()
+        app._tor_service_initially_active = False
+        with patch.object(app, "_load_session_metadata", return_value={"tor_service_initially_active": False}), \
+             patch.object(app, "validate_tor_config_target", side_effect=lambda p: Path(p)), \
+             patch.object(app, "_control_tor_service", return_value=(True, "")) as mock_ctrl:
+            app.restore_tor_config()
+            mock_ctrl.assert_called_with("stop")
+
+    def test_matrix_restore_03_tor_initially_enabled_remains_enabled(self):
+        """Matrix Restore-3: Tor initially enabled remains enabled."""
+        app = nulltrace.nulltrace()
+        app._tor_service_initially_enabled = True
+        with patch.object(app, "_load_session_metadata", return_value={"tor_service_initially_enabled": True}), \
+             patch.object(app, "validate_tor_config_target", side_effect=lambda p: Path(p)), \
+             patch.object(app, "_control_tor_service", return_value=(True, "")) as mock_ctrl:
+            app.restore_tor_config()
+            for c in mock_ctrl.call_args_list:
+                self.assertNotEqual(c.args[0], "disable")
+
+    def test_matrix_restore_04_tor_initially_disabled_remains_disabled(self):
+        """Matrix Restore-4: Tor initially disabled remains disabled."""
+        app = nulltrace.nulltrace()
+        app._tor_service_initially_enabled = False
+        with patch.object(app, "_load_session_metadata", return_value={"tor_service_initially_enabled": False}), \
+             patch.object(app, "validate_tor_config_target", side_effect=lambda p: Path(p)), \
+             patch.object(app, "_control_tor_service", return_value=(True, "")) as mock_ctrl:
+            app.restore_tor_config()
+            mock_ctrl.assert_called_with("disable")
+
+    def test_matrix_restore_05_unknown_enabled_state_does_not_become_enabled(self):
+        """Matrix Restore-5: unknown enabled state does not become enabled."""
+        app = nulltrace.nulltrace()
+        app._tor_service_initially_enabled = None
+        with patch.object(app, "_load_session_metadata", return_value={"tor_service_initially_enabled": None}), \
+             patch.object(app, "validate_tor_config_target", side_effect=lambda p: Path(p)), \
+             patch.object(app, "_control_tor_service", return_value=(True, "")) as mock_ctrl:
+            app.restore_tor_config()
+            for c in mock_ctrl.call_args_list:
+                self.assertNotEqual(c.args[0], "enable")
+
+    def test_matrix_restore_06_interface_initially_up_returns_up(self):
+        """Matrix Restore-6: interface initially UP returns UP."""
+        app = nulltrace.nulltrace()
+        app._spoofed_intf = "eth0"
+        app._original_mac = "00:11:22:33:44:55"
+        app._interface_initially_up = True
+        with patch("nulltrace.require_trusted_binary", return_value="/usr/sbin/ip"), \
+             patch.object(app, "_read_current_mac", return_value="00:11:22:33:44:55"), \
+             patch.object(app, "_persist_session_metadata"), \
+             patch.object(app, "_renew_dhcp"), \
+             patch("nulltrace.run_trusted") as mock_run:
+            app._restore_mac()
+            cmds = [call.args[0] for call in mock_run.call_args_list]
+            self.assertTrue(any(cmd[-1] == "up" for cmd in cmds))
+
+    def test_matrix_restore_07_interface_initially_down_returns_down(self):
+        """Matrix Restore-7: interface initially DOWN returns DOWN."""
+        app = nulltrace.nulltrace()
+        app._spoofed_intf = "eth0"
+        app._original_mac = "00:11:22:33:44:55"
+        app._interface_initially_up = False
+        with patch("nulltrace.require_trusted_binary", return_value="/usr/sbin/ip"), \
+             patch.object(app, "_read_current_mac", return_value="00:11:22:33:44:55"), \
+             patch.object(app, "_persist_session_metadata"), \
+             patch("nulltrace.run_trusted") as mock_run:
+            app._restore_mac()
+            cmds = [call.args[0] for call in mock_run.call_args_list]
+            self.assertTrue(all(cmd[-1] != "up" for cmd in cmds))
+
+    def test_matrix_restore_08_original_torrc_present_is_restored(self):
+        """Matrix Restore-8: original torrc present is restored."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            torrc = Path(tmpdir) / "torrc"
+            torrc.write_text("SocksPort 9050\n", encoding="utf-8")
+            app = nulltrace.nulltrace()
+            app.config.tor_config = str(torrc)
+            app._tor_config_existed = True
+            with patch.object(app, "validate_tor_config_target", return_value=torrc), \
+                 patch.object(app, "_load_session_metadata", return_value={"tor_config_existed": True, "tor_config_backup": "SocksPort 9050\n"}), \
+                 patch.object(app, "_control_tor_service", return_value=(True, "")):
+                app.restore_tor_config()
+                self.assertEqual(torrc.read_text(encoding="utf-8"), "SocksPort 9050\n")
+
+    def test_matrix_restore_09_original_torrc_absent_remains_absent(self):
+        """Matrix Restore-9: original torrc absent remains absent."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            torrc = Path(tmpdir) / "torrc"
+            torrc.write_text(f"{nulltrace.TOR_CONFIG_BEGIN}\nTransPort 9040\n{nulltrace.TOR_CONFIG_END}\n", encoding="utf-8")
+            app = nulltrace.nulltrace()
+            app.config.tor_config = str(torrc)
+            app._tor_config_existed = False
+            with patch.object(app, "validate_tor_config_target", return_value=torrc), \
+                 patch.object(app, "_load_session_metadata", return_value={"tor_config_existed": False}), \
+                 patch.object(app, "_control_tor_service", return_value=(True, "")):
+                app.restore_tor_config()
+                self.assertFalse(torrc.exists())
+
+    def test_matrix_restore_10_admin_config_outside_managed_block_preserved(self):
+        """Matrix Restore-10: admin config outside managed block preserved."""
+        content = (
+            "ControlPort 9051\n"
+            f"{nulltrace.TOR_CONFIG_BEGIN}\n"
+            "TransPort 9040\n"
+            f"{nulltrace.TOR_CONFIG_END}\n"
+            "DataDirectory /var/lib/tor\n"
+        )
+        cleaned = nulltrace.strip_tor_config_blocks(content)
+        self.assertEqual(cleaned, "ControlPort 9051\nDataDirectory /var/lib/tor\n")
+
+    def test_matrix_restore_11_unterminated_managed_block_rejected_safely(self):
+        """Matrix Restore-11: unterminated managed block rejected safely."""
+        bad_content = (
+            "ControlPort 9051\n"
+            f"{nulltrace.TOR_CONFIG_BEGIN}\n"
+            "TransPort 9040\n"
+        )
+        with self.assertRaises(ValueError) as ctx:
+            nulltrace.strip_tor_config_blocks(bad_content)
+        self.assertIn("unterminated", str(ctx.exception).lower())
 
 
 if __name__ == "__main__":

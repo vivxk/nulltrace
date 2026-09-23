@@ -406,3 +406,74 @@ This section details the final security overhaul addressing every ticket in `nul
 - **`atomic_write()`**: Added open file descriptor permissions setting (`fchmod`/`fchown` on `tf.fileno()`), parent directory symlink rejection in fallback mode, and pre-replacement symlink validation in fallback mode.
 - **`resolve_trusted_binary()`**: Validated root ownership on both the symlink itself and resolved target on POSIX systems.
 - **Regression Suite (Section 11)**: Expanded `TestSection11_ComprehensiveRegressions` with 11 additional unit tests, achieving 130 passing tests (100% pass rate) covering every bullet point in the specification document.
+
+---
+
+## Linux-First Implementation & Section 18 Test Matrix Hardening
+
+### P0-1: Genuinely Race-Resistant FD-Relative `atomic_write()` on Linux
+- Replaced pathname fallbacks with genuine FD-relative Linux operations:
+  - Parent directory securely opened with `O_RDONLY | O_DIRECTORY | O_NOFOLLOW` and validated via `fstat()`.
+  - Temporary files created directly within open directory descriptor using `O_CREAT | O_EXCL | O_RDWR | O_NOFOLLOW | O_CLOEXEC` with `dir_fd`.
+  - Permissions and ownership metadata applied directly to the open file descriptor (`fchmod`, `fchown`) *before* fsync.
+  - Durable `fsync(tmp_fd)` performed on the file before replacement.
+  - Final replacement executed via `os.rename(tmp_name, dest_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)`, which atomically replaces destinations on POSIX while eliminating TOCTOU pathname resolution. Fails closed on Linux if `os.rename in os.supports_dir_fd` is unsupported.
+  - Parent directory durably synced via `os.fsync(dir_fd)`.
+
+### P0-2: Privileged Installer Deployment Hardening (`install.py`)
+- Implemented `secure_deploy_file()`:
+  - Validates ancestor directory hierarchy leading to targets, verifying root ownership and non-writable permissions (`mode & 0o022 == 0` without sticky bit).
+  - Securely opens parent directory descriptor with `O_DIRECTORY | O_NOFOLLOW`.
+  - Creates temporary files via `dir_fd` with `O_NOFOLLOW | O_EXCL`.
+  - Atomically replaces target via `dir_fd` without following symlinks.
+  - Eliminates reliance on `shutil.copy2` and pathname-based `write_text` for privileged deployments of `/usr/share/nulltrace/nulltrace.py` and `/usr/bin/nulltrace`.
+
+### P0-3: Local Checkout Execution Prevention on Uninstallation (`install.py`)
+- In `uninstall_nulltrace()`, hardened emergency teardown:
+  - Verifies that `/usr/share/nulltrace/nulltrace.py` exists, is a regular file, is root-owned, and is non-writable before invoking `--force-stop`.
+  - Refuses to execute the local untrusted git checkout as root when installed tooling is missing or untrusted.
+
+### P1-1: Strict Emergency Cleanup Command Verification (`install.py`)
+- In `uninstall_nulltrace()`, recorded return codes and errors for all `iptables` and `ip6tables` emergency flush/delete commands.
+- Aborts removal of recovery tooling if any command fails or if post-flush inspection does not report `CLEAN`.
+
+### P1-2: Strict Tor Process Identity UID Semantics
+- In `_verify_process_is_tor()`:
+  - Effective UID must strictly equal the expected Tor UID.
+  - Real UID must be the expected Tor UID or 0 (privilege drop service).
+  - Fails closed if the expected Tor UID cannot be established from system configuration or `pwd`.
+
+### P1-3: Multi-PID Shared Socket Ambiguity Resolution
+- In `_find_pid_by_socket_inode()`:
+  - Never returns an unverified PID.
+  - Iterates through all candidate processes on a shared socket (e.g. `SO_REUSEPORT`) and requires *all* candidate PIDs to be verified Tor daemons.
+  - Returns `None` if any candidate fails verification or if candidate identities conflict.
+
+### P1-4: Tri-State Service Enable Detection & Safe Restoration
+- In `_check_tor_service_enabled()`:
+  - Returns `Optional[bool]` (tristate: `True`, `False`, or `None` when unknown).
+  - Never converts `None` (unknown) to enabled.
+- In `restore_tor_config()`:
+  - Only disables Tor if `tor_service_initially_enabled` was explicitly `False`.
+
+### P1-5: Fail-Closed Directory Permission Validation
+- In `_validate_secure_directory()`:
+  - Raises `RuntimeError` immediately upon detecting group or world writable permissions without performing silent `os.chmod` modifications.
+
+### P1-6: MAC Restoration Exception Handling
+- In `_randomize_mac()`:
+  - Exception handler honors `_interface_initially_up` when restoring link state after MAC change failures.
+
+### P2-1: Accurate Staged/Durable Activation Terminology & Destructive Restore Warning
+- Clarified that Nulltrace uses staged/durable activation with crash recovery rather than claiming a single-transaction atomic iptables commit.
+- Added explicit documentation and CLI warnings for `--destructive-restore`:
+  > WARNING: This operation can overwrite firewall changes made after NullTrace activation.
+
+### Section 18: Complete Linux Test Matrix Implementation
+- Implemented `TestSection18_LinuxTestMatrix` in `tests/test_remediation.py` comprising 53 exhaustive test cases covering all 5 requirement groups:
+  1. Filesystem Security (14 tests): destination symlink, parent symlink, ancestor symlink, race/directory replacement, insecure owner, group/world writable directory, insecure target, secure target, temp file directory, atomic replacement, metadata order before fsync, fatal file fsync, fatal directory fsync, interrupted write safety.
+  2. Firewall (14 tests): exact first jump, conditional jump, non-first jump, preceding accept, duplicate jump, ordered fingerprints, reordered rules, missing manifest, corrupt manifest, incomplete manifest, IPv4 mismatch, IPv6 mismatch, IPv6 inspection failure produces UNKNOWN, partial activation recovery.
+  3. Tor Identity (8 tests): fake tor rejected, fake tor.real rejected, wrong UID rejected, wrong executable rejected, correct Tor accepted, `/proc/<pid>/exe` validation, shared socket ownership, ambiguous ownership.
+  4. Installer (6 tests): destination symlink rejected, insecure `/usr/share/nulltrace` rejected, insecure `/usr/bin` destination rejected, atomic replacement, temp launcher symlink safety, refusal to execute untrusted local checkout.
+  5. Service & Interface Restoration (11 tests): initially active/inactive Tor preserved, initially enabled/disabled Tor preserved, unknown enabled state preserved, interface UP/DOWN restored, original torrc presence/absence restored, admin config preserved, unterminated managed block rejected safely.
+- **Total Test Suite**: 183 tests, 100% passing both in WSL Kali Linux (5.30s) and on Windows (1.86s).

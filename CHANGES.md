@@ -1,5 +1,61 @@
 # nulltrace Security Hardening & Remediation Changelog
 
+## Critical Security Remediation & Invariant Hardening (Issues #1 through #12)
+
+This release implements comprehensive security remediations across state management, Tor identity verification, ControlPort cookie protection, authenticated firewall teardown, and baseline-before-mutation guarantees.
+
+---
+
+### Critical Issue #1: UNKNOWN Tor Active State Must Not Become INACTIVE
+- **Location**: `nulltrace.py` (`_has_verified_tor_process()`, `_control_tor_service("is-active")`, `check_tor_service()`)
+- **Fix**: Replaced binary active/inactive collapsing with a strict fail-closed tri-state model (`True` = ACTIVE, `False` = INACTIVE, `None` = UNKNOWN). Any `/proc` access failure, service-manager error, or ambiguous state preserves `None` (UNKNOWN). Teardown and recovery reject UNKNOWN baseline as `RESTORE_FAILED` instead of guessing inactive.
+
+### Critical Issue #2: Recovery Must Never Fabricate Baseline Values
+- **Location**: `nulltrace.py` (`_load_session_metadata()`, `restore_tor_config()`, `_restore_mac()`)
+- **Fix**: Prohibited guessing defaults (`getattr(..., True)`) during recovery. Missing, corrupt, invalid, or UNKNOWN baseline fields (`tor_config_existed`, `tor_service_initially_active`, `interface_initially_up`, `original_mac`, `spoofed_intf`) trigger immediate `RESTORE_FAILED` / `RECOVERY_REQUIRED` without mutating host state.
+
+### Critical Issue #3: Stale Historical Sessions Must Never Become Automatic Recovery Targets
+- **Location**: `nulltrace.py` (`_discover_session_id()`)
+- **Fix**: Isolated automatic recovery to the single authoritative current session pointed to by `state.json`. Scanning `/var/lib/nulltrace/session_*` for historical failed sessions is outlawed. Stale failed sessions require explicit administrator intervention.
+
+### Critical Issue #4: Session Identity 4-Way Invariant Consistency
+- **Location**: `nulltrace.py` (`_load_session_metadata()`)
+- **Fix**: Enforced strict cross-record identity validation: `session directory basename == state.session_id == metadata.session_id == manifest.session_id`. Any mismatch or corrupted record immediately returns `RECOVERY_REQUIRED` without guessing.
+
+### Critical Issue #5: Firewall Jump Removal Requires Ownership Authentication
+- **Location**: `nulltrace.py` (`_deactivate_jump_rules()`)
+- **Fix**: Extended ownership authentication to top-level jump deletion. Before removing jumps from base chains (`OUTPUT`, `INPUT`, `FORWARD`, `PREROUTING`), target chains are inspected to verify the exact NullTrace ownership marker (`nulltrace-owned`). If ownership cannot be established, jump deletion is refused and teardown halts fail-closed (`RECOVERY_REQUIRED`).
+
+### Critical Issue #6: Chain Absence Requires Positive Proof
+- **Location**: `nulltrace.py` (`_authenticate_or_create_chain()`, `_destroy_authenticated_chain()`, `_deactivate_jump_rules()`)
+- **Fix**: Chain absence is inferred solely from explicit not-found substrings (`"no chain/target/match by that name"`, `"does not exist"`). Generic non-zero return codes with empty stderr, permission errors, and xtables lock contentions are treated as fatal `INSPECTION_ERROR` and abort fail-closed.
+
+### Critical Issue #7: Service Actions Verify Post-Conditions
+- **Location**: `nulltrace.py` (`_control_tor_service()`)
+- **Fix**: Command exit code 0 is no longer sufficient to declare service success. START/RESTART verifies process liveness, UID, and listener responsiveness; STOP verifies process and listener termination; ENABLE/DISABLE verifies `is-enabled` status.
+
+### Critical Issue #8: ControlPort 0 Handling & Cookie Authentication Protection
+- **Location**: `nulltrace.py` (`_read_control_port()`, `_tor_control_newnym()`, `_parse_tor_control_reply()`)
+- **Fix**: Explicitly parsed `ControlPort 0` as port 0 (disabled), never defaulting to 9051. Before reading or transmitting authentication cookies, listener socket ownership is verified to belong to the authentic Tor daemon. Implemented RFC-accurate reply status parsing requiring code 250 while rejecting 4xx/5xx error responses.
+
+### Critical Issue #9: `tor.real` Trusted Executable Verification
+- **Location**: `nulltrace.py` (`_verify_process_is_tor()`)
+- **Fix**: Subjected `tor.real` to the exact same strict verification pipeline as `tor`: `/proc/<pid>/exe` target containment in `TRUSTED_BIN_DIRS`, regular file check, root ownership (UID 0), no group/world-writable bits (`mode & 0o022 == 0`), and trusted directory hierarchy validation.
+
+### Critical Issue #10: Tor Configuration Restoration Post-Condition Verification
+- **Location**: `nulltrace.py` (`restore_tor_config()`)
+- **Fix**: Enforced post-restoration verification: verified that managed configuration blocks are stripped, backup integrity is validated when torrc initially existed, and restored file maintains root ownership with secure permissions before setting `_tor_file_restored = True`.
+
+### Critical Issue #11: Baseline Complete Before Any System Mutation
+- **Location**: `nulltrace.py` (`setup_network_rules()`)
+- **Fix**: Sequenced complete baseline capture (Tor active/enabled state, torrc presence, MAC address, administrative UP/DOWN state) and persisted authoritative metadata to disk BEFORE performing any mutation on Tor, firewall, or interfaces. If any required baseline field is UNKNOWN, activation aborts immediately.
+
+### Critical Issue #12: MAC Randomization Uses Captured Baseline Interface
+- **Location**: `nulltrace.py` (`_randomize_mac()`, `setup_network_rules()`)
+- **Fix**: Fixed MAC randomization to strictly operate on the interface captured during baseline collection (`_spoofed_intf`). It never re-runs interface discovery or switches interfaces mid-session. If the captured interface is no longer available in sysfs, it fails safely with `RuntimeError`.
+
+---
+
 ## Architectural Remediation & Security Overhaul (Tickets NT-001 through NT-016)
 
 This document details the comprehensive security remediation executed to guarantee the privacy invariant that all system traffic is either provably Tor-routed or blocked.

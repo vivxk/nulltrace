@@ -484,6 +484,7 @@ class TestNT011_MACPersistenceAndRestore(unittest.TestCase):
     def test_restore_mac_uses_ip_link_without_macchanger(self, mock_dhcp, mock_run, mock_req, mock_res):
         self.app._spoofed_intf = "eth0"
         self.app._original_mac = "00:11:22:33:44:55"
+        self.app._interface_initially_up = True
 
         with patch.object(self.app, "_read_current_mac", return_value="00:11:22:33:44:55"):
             self.app._restore_mac()
@@ -741,6 +742,12 @@ class TestP0_RecoveryAndEnforcementTruth(unittest.TestCase):
             tmp_path = Path(tmpdir)
             with patch("nulltrace.PERSISTENT_DIR", tmp_path), patch("nulltrace.RUN_DIR", tmp_path):
                 app = nulltrace.nulltrace()
+                sdir = tmp_path / f"session_{app.session_id}"
+                sdir.mkdir(parents=True, exist_ok=True)
+                (sdir / "metadata.json").write_text(json.dumps({
+                    "session_id": app.session_id,
+                    "state": nulltrace.STATE_ACTIVE,
+                }), encoding="utf-8")
                 (tmp_path / "state.json").write_text(json.dumps({
                     "session_id": app.session_id,
                     "state": nulltrace.STATE_ACTIVE,
@@ -847,7 +854,7 @@ class TestP0_RecoveryAndEnforcementTruth(unittest.TestCase):
 
                 app = nulltrace.nulltrace()
                 sid = app._discover_session_id()
-                self.assertEqual(sid, "222222222222")
+                self.assertIsNone(sid)
 
     def test_p0_1_missing_session_directory_fails_safely(self):
         """P0.1: Missing session directory fails safely without claiming clean or inventing false state."""
@@ -1280,7 +1287,14 @@ class TestP2_CorrectnessRecoveryUX(unittest.TestCase):
             tmp_path = Path(tmpdir)
             with patch("nulltrace.PERSISTENT_DIR", tmp_path), patch("nulltrace.RUN_DIR", tmp_path):
                 app = nulltrace.nulltrace()
-                with patch.object(app, "validate_tor_config_target", return_value=tmp_path / "torrc"), \
+                app._tor_config_existed = True
+                app._tor_initially_active = True
+                sdir = tmp_path / f"session_{app.session_id}"
+                sdir.mkdir(parents=True, exist_ok=True)
+                (sdir / "torrc.bak").write_text("# baseline\n", encoding="utf-8")
+                torrc = tmp_path / "torrc"
+                torrc.write_text("# baseline\n", encoding="utf-8")
+                with patch.object(app, "validate_tor_config_target", return_value=torrc), \
                      patch.object(app, "_control_tor_service", return_value=(False, "unit masked")):
                     with self.assertRaises(RuntimeError) as ctx:
                         app.restore_tor_config()
@@ -1348,6 +1362,8 @@ class TestP2_CorrectnessRecoveryUX(unittest.TestCase):
             tmp_path = Path(tmpdir)
             with patch("nulltrace.PERSISTENT_DIR", tmp_path), patch("nulltrace.RUN_DIR", tmp_path):
                 app = nulltrace.nulltrace()
+                app._tor_config_existed = True
+                app._tor_initially_active = True
                 sid = app.session_id
                 sdir = tmp_path / f"session_{sid}"
                 sdir.mkdir(parents=True)
@@ -1680,6 +1696,7 @@ class TestHandoffRemediationNewIssues(unittest.TestCase):
                 # Baseline torrc
                 original_torrc = "# Original config\nSocksPort 9050\n"
                 torrc.write_text(original_torrc, encoding="utf-8")
+                app._tor_initially_active = True
 
                 with patch.object(app, "validate_tor_config_target", return_value=torrc), \
                      patch.object(app, "_restart_tor"), \
@@ -2196,7 +2213,7 @@ class TestSection11_ComprehensiveRegressions(unittest.TestCase):
             torrc.write_text(f"{nulltrace.TOR_CONFIG_BEGIN}\nTransPort 9040\n{nulltrace.TOR_CONFIG_END}\n", encoding="utf-8")
             app._tor_config_existed = False
             with patch.object(app, "validate_tor_config_target", return_value=torrc), \
-                 patch.object(app, "_load_session_metadata", return_value={"tor_config_existed": False}), \
+                 patch.object(app, "_load_session_metadata", return_value={"tor_config_existed": False, "tor_service_initially_active": False}), \
                  patch.object(app, "_control_tor_service", return_value=(True, "")):
                 app.restore_tor_config()
                 self.assertFalse(torrc.exists(), "Originally absent torrc should be deleted when only managed block existed")
@@ -2208,7 +2225,7 @@ class TestSection11_ComprehensiveRegressions(unittest.TestCase):
             )
             app._tor_config_existed = False
             with patch.object(app, "validate_tor_config_target", return_value=torrc), \
-                 patch.object(app, "_load_session_metadata", return_value={"tor_config_existed": False}), \
+                 patch.object(app, "_load_session_metadata", return_value={"tor_config_existed": False, "tor_service_initially_active": False}), \
                  patch.object(app, "_control_tor_service", return_value=(True, "")):
                 app.restore_tor_config()
                 self.assertTrue(torrc.exists())
@@ -3356,7 +3373,7 @@ class TestSection18_LinuxTestMatrix(unittest.TestCase):
         """Matrix Restore-1: Tor initially active remains active (restarted, never stopped)."""
         app = nulltrace.nulltrace()
         app._tor_service_initially_active = True
-        with patch.object(app, "_load_session_metadata", return_value={"tor_service_initially_active": True}), \
+        with patch.object(app, "_load_session_metadata", return_value={"tor_service_initially_active": True, "tor_config_existed": False}), \
              patch.object(app, "validate_tor_config_target", side_effect=lambda p: Path(p)), \
              patch.object(app, "_control_tor_service", return_value=(True, "")) as mock_ctrl:
             app.restore_tor_config()
@@ -3366,7 +3383,7 @@ class TestSection18_LinuxTestMatrix(unittest.TestCase):
         """Matrix Restore-2: Tor initially inactive remains inactive."""
         app = nulltrace.nulltrace()
         app._tor_service_initially_active = False
-        with patch.object(app, "_load_session_metadata", return_value={"tor_service_initially_active": False}), \
+        with patch.object(app, "_load_session_metadata", return_value={"tor_service_initially_active": False, "tor_config_existed": False}), \
              patch.object(app, "validate_tor_config_target", side_effect=lambda p: Path(p)), \
              patch.object(app, "_control_tor_service", return_value=(True, "")) as mock_ctrl:
             app.restore_tor_config()
@@ -3376,7 +3393,7 @@ class TestSection18_LinuxTestMatrix(unittest.TestCase):
         """Matrix Restore-3: Tor initially enabled remains enabled."""
         app = nulltrace.nulltrace()
         app._tor_service_initially_enabled = True
-        with patch.object(app, "_load_session_metadata", return_value={"tor_service_initially_enabled": True}), \
+        with patch.object(app, "_load_session_metadata", return_value={"tor_service_initially_active": True, "tor_service_initially_enabled": True, "tor_config_existed": False}), \
              patch.object(app, "validate_tor_config_target", side_effect=lambda p: Path(p)), \
              patch.object(app, "_control_tor_service", return_value=(True, "")) as mock_ctrl:
             app.restore_tor_config()
@@ -3387,7 +3404,7 @@ class TestSection18_LinuxTestMatrix(unittest.TestCase):
         """Matrix Restore-4: Tor initially disabled remains disabled."""
         app = nulltrace.nulltrace()
         app._tor_service_initially_enabled = False
-        with patch.object(app, "_load_session_metadata", return_value={"tor_service_initially_enabled": False}), \
+        with patch.object(app, "_load_session_metadata", return_value={"tor_service_initially_active": True, "tor_service_initially_enabled": False, "tor_config_existed": False}), \
              patch.object(app, "validate_tor_config_target", side_effect=lambda p: Path(p)), \
              patch.object(app, "_control_tor_service", return_value=(True, "")) as mock_ctrl:
             app.restore_tor_config()
@@ -3397,7 +3414,7 @@ class TestSection18_LinuxTestMatrix(unittest.TestCase):
         """Matrix Restore-5: unknown enabled state does not become enabled."""
         app = nulltrace.nulltrace()
         app._tor_service_initially_enabled = None
-        with patch.object(app, "_load_session_metadata", return_value={"tor_service_initially_enabled": None}), \
+        with patch.object(app, "_load_session_metadata", return_value={"tor_service_initially_active": True, "tor_service_initially_enabled": None, "tor_config_existed": False}), \
              patch.object(app, "validate_tor_config_target", side_effect=lambda p: Path(p)), \
              patch.object(app, "_control_tor_service", return_value=(True, "")) as mock_ctrl:
             app.restore_tor_config()
@@ -3443,7 +3460,7 @@ class TestSection18_LinuxTestMatrix(unittest.TestCase):
             app.config.tor_config = str(torrc)
             app._tor_config_existed = True
             with patch.object(app, "validate_tor_config_target", return_value=torrc), \
-                 patch.object(app, "_load_session_metadata", return_value={"tor_config_existed": True, "tor_config_backup": "SocksPort 9050\n"}), \
+                 patch.object(app, "_load_session_metadata", return_value={"tor_service_initially_active": True, "tor_config_existed": True, "tor_config_backup": "SocksPort 9050\n"}), \
                  patch.object(app, "_control_tor_service", return_value=(True, "")):
                 app.restore_tor_config()
                 self.assertEqual(torrc.read_text(encoding="utf-8"), "SocksPort 9050\n")
@@ -3457,7 +3474,7 @@ class TestSection18_LinuxTestMatrix(unittest.TestCase):
             app.config.tor_config = str(torrc)
             app._tor_config_existed = False
             with patch.object(app, "validate_tor_config_target", return_value=torrc), \
-                 patch.object(app, "_load_session_metadata", return_value={"tor_config_existed": False}), \
+                 patch.object(app, "_load_session_metadata", return_value={"tor_service_initially_active": False, "tor_config_existed": False}), \
                  patch.object(app, "_control_tor_service", return_value=(True, "")):
                 app.restore_tor_config()
                 self.assertFalse(torrc.exists())
@@ -3529,7 +3546,7 @@ class TestLatestRemediations_NT01_Through_NT12(unittest.TestCase):
         with patch.object(self.app, "_load_session_metadata", return_value={
             "tor_service_initially_active": True,
             "tor_service_initially_enabled": None,
-            "tor_config_existed": True,
+            "tor_config_existed": False,
         }), patch.object(self.app, "validate_tor_config_target") as mock_val, \
            patch.object(self.app, "_control_tor_service", return_value=(True, "")) as mock_ctrl:
             mock_val.return_value.exists.return_value = False
@@ -3667,7 +3684,7 @@ class TestLatestRemediations_NT01_Through_NT12(unittest.TestCase):
         with patch.object(self.app, "_load_session_metadata", return_value={
             "tor_service_initially_active": False,
             "tor_service_initially_enabled": False,
-            "tor_config_existed": True,
+            "tor_config_existed": False,
         }), patch.object(self.app, "validate_tor_config_target") as mock_val, \
            patch.object(self.app, "_control_tor_service") as mock_ctrl:
             mock_val.return_value.exists.return_value = False
@@ -3705,9 +3722,10 @@ class TestLatestRemediations_NT01_Through_NT12(unittest.TestCase):
             # When neither sysfs nor ip utility is available
             self.assertIsNone(self.app._is_interface_up("eth0"))
 
-        with patch.object(self.app, "_get_primary_interface", return_value="eth0"), \
-             patch.object(self.app, "_read_current_mac", return_value="00:11:22:33:44:55"), \
-             patch.object(self.app, "_is_interface_up", return_value=None), \
+        self.app._spoofed_intf = "eth0"
+        self.app._original_mac = "00:11:22:33:44:55"
+        self.app._interface_initially_up = None
+        with patch.object(self.app, "_is_interface_up", return_value=None), \
              patch("nulltrace.resolve_trusted_binary", return_value="/usr/bin/macchanger"):
             with self.assertRaises(RuntimeError) as ctx:
                 self.app._randomize_mac()
@@ -3726,7 +3744,7 @@ class TestLatestRemediations_NT01_Through_NT12(unittest.TestCase):
             )
             self.app.config.tor_config = str(torrc)
             with patch.object(self.app, "validate_tor_config_target", return_value=torrc), \
-                 patch.object(self.app, "_load_session_metadata", return_value={"tor_config_existed": True}), \
+                 patch.object(self.app, "_load_session_metadata", return_value={"tor_config_existed": True, "tor_service_initially_active": True, "tor_config_backup": "ControlPort 9051\nDataDirectory /var/lib/tor\n"}), \
                  patch.object(self.app, "_control_tor_service", return_value=(True, "")):
                 self.app.restore_tor_config()
                 self.assertEqual(torrc.read_text(encoding="utf-8"), admin_content)
@@ -4075,7 +4093,11 @@ class TestSection46_AdminChangeAdversarial(unittest.TestCase):
             )
             self.app.config.tor_config = str(torrc)
             with patch.object(self.app, "validate_tor_config_target", return_value=torrc), \
-                 patch.object(self.app, "_load_session_metadata", return_value={"tor_config_existed": True}), \
+                 patch.object(self.app, "_load_session_metadata", return_value={
+                     "tor_config_existed": True,
+                     "tor_service_initially_active": True,
+                     "tor_config_backup": "SocksPort 9050\nDataDirectory /var/lib/tor\n",
+                 }), \
                  patch.object(self.app, "_control_tor_service", return_value=(True, "")):
                 self.app.restore_tor_config()
                 content = torrc.read_text(encoding="utf-8")
@@ -4096,7 +4118,10 @@ class TestSection46_AdminChangeAdversarial(unittest.TestCase):
 
             with patch("nulltrace.PERSISTENT_DIR", tmp_path), \
                  patch.object(self.app, "validate_tor_config_target", return_value=torrc), \
-                 patch.object(self.app, "_load_session_metadata", return_value={"tor_config_existed": True}), \
+                 patch.object(self.app, "_load_session_metadata", return_value={
+                     "tor_config_existed": True,
+                     "tor_service_initially_active": True,
+                 }), \
                  patch.object(self.app, "_control_tor_service", return_value=(True, "")):
                 self.app.restore_tor_config()
                 self.assertTrue(torrc.exists())
@@ -4293,8 +4318,528 @@ class TestSection48_InstallerAdversarial(unittest.TestCase):
         self.assertTrue(suspicious)
 
 
+class TestSection49_CriticalSecurityRemediations(unittest.TestCase):
+    """
+    Direct verification of all 12 critical issues from nulltrace_critical_security_remediation_handoff.md:
+    1. Tor active UNKNOWN handling
+    2. Recovery baseline integrity
+    3. Stale session isolation
+    4. Session identity consistency (4-way)
+    5. Firewall jump ownership
+    6. iptables absence/error handling
+    7. Service post-condition verification
+    8. ControlPort security & cookie protection
+    9. tor.real identity & validation
+    10. Tor config restoration verification
+    11. Baseline-before-mutation
+    12. Captured-interface MAC handling
+    """
+
+    def setUp(self):
+        self.app = nulltrace.nulltrace()
+        self.app._tor_user = "109"
+
+    def test_issue1_tor_active_tri_state_semantics(self):
+        """Issue 1: check_tor_service tri-state semantics (True=ACTIVE, False=INACTIVE, None=UNKNOWN) and teardown enforcement."""
+        # 1. Positively verified active
+        with patch.object(self.app, "_has_verified_tor_process", return_value=True), \
+             patch("nulltrace.resolve_trusted_binary", side_effect=lambda n: f"/usr/bin/{n}"), \
+             patch("nulltrace.run_trusted", return_value=MagicMock(returncode=0, stdout="active", stderr="")):
+            self.assertEqual(self.app.check_tor_service(), True)
+
+        # 2. Positively verified inactive
+        with patch.object(self.app, "_has_verified_tor_process", return_value=False), \
+             patch("nulltrace.resolve_trusted_binary", side_effect=lambda n: f"/usr/bin/{n}"), \
+             patch("nulltrace.run_trusted", return_value=MagicMock(returncode=3, stdout="inactive", stderr="")):
+            self.assertEqual(self.app.check_tor_service(), False)
+
+        # 3. /proc inspection failure -> UNKNOWN (None)
+        with patch.object(self.app, "_has_verified_tor_process", side_effect=PermissionError("Permission denied /proc")), \
+             patch("nulltrace.resolve_trusted_binary", side_effect=lambda n: f"/usr/bin/{n}"):
+            self.assertIsNone(self.app.check_tor_service())
+
+        # 4. Service manager failure / unexpected code -> UNKNOWN (None)
+        with patch.object(self.app, "_has_verified_tor_process", return_value=False), \
+             patch("nulltrace.resolve_trusted_binary", side_effect=lambda n: f"/usr/bin/{n}" if n == "systemctl" else None), \
+             patch("nulltrace.run_trusted", return_value=MagicMock(returncode=1, stdout="", stderr="connection refused to systemd bus")):
+            self.assertIsNone(self.app.check_tor_service())
+
+        # 5. Teardown cannot interpret UNKNOWN as INACTIVE: restore_tor_config raises when baseline is UNKNOWN
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with patch("nulltrace.PERSISTENT_DIR", tmp_path), \
+                 patch("nulltrace.RUN_DIR", tmp_path):
+                sdir = tmp_path / f"session_{self.app.session_id}"
+                sdir.mkdir(parents=True, exist_ok=True)
+                meta = {
+                    "session_id": self.app.session_id,
+                    "baseline_captured": True,
+                    "tor_config_existed": True,
+                    "tor_service_initially_active": None,
+                }
+                (sdir / "metadata.json").write_text(json.dumps(meta), encoding="utf-8")
+                (sdir / "torrc.bak").write_text("SOCKSPort 9050\n", encoding="utf-8")
+                with self.assertRaises(RuntimeError) as ctx:
+                    self.app.restore_tor_config()
+                self.assertIn("tor_service_initially_active", str(ctx.exception))
+                self.assertIn("RESTORE_FAILED", str(ctx.exception))
+
+    def test_issue2_recovery_refuses_fabricated_baseline(self):
+        """Issue 2: Recovery refuses to mutate host state using invented/guessed baseline defaults."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with patch("nulltrace.PERSISTENT_DIR", tmp_path), \
+                 patch("nulltrace.RUN_DIR", tmp_path):
+                sdir = tmp_path / f"session_{self.app.session_id}"
+                sdir.mkdir(parents=True, exist_ok=True)
+
+                # Corrupt metadata file
+                meta_file = sdir / "metadata.json"
+                meta_file.write_text("{invalid json", encoding="utf-8")
+                with self.assertRaises(RuntimeError) as ctx:
+                    self.app._load_session_metadata()
+                self.assertIn("corrupt", str(ctx.exception).lower())
+
+                # Missing tor_config_existed in captured baseline
+                meta = {
+                    "session_id": self.app.session_id,
+                    "baseline_captured": True,
+                    "tor_service_initially_active": False,
+                }
+                meta_file.write_text(json.dumps(meta), encoding="utf-8")
+                with self.assertRaises(RuntimeError) as ctx:
+                    self.app.restore_tor_config()
+                self.assertIn("tor_config_existed", str(ctx.exception))
+                self.assertIn("RESTORE_FAILED", str(ctx.exception))
+
+                # Missing interface_initially_up when MAC was spoofed
+                meta = {
+                    "session_id": self.app.session_id,
+                    "baseline_captured": True,
+                    "spoofed_intf": "eth0",
+                    "original_mac": "00:11:22:33:44:55",
+                }
+                meta_file.write_text(json.dumps(meta), encoding="utf-8")
+                with patch.object(self.app, "_read_current_mac", return_value="00:11:22:33:44:55"), \
+                     patch("nulltrace.require_trusted_binary", return_value="/usr/sbin/ip"), \
+                     patch("nulltrace.run_trusted"):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        self.app._restore_mac()
+                    self.assertIn("interface_initially_up", str(ctx.exception))
+                    self.assertIn("RESTORE_FAILED", str(ctx.exception))
+
+    def test_issue3_stale_sessions_isolated_from_automatic_recovery(self):
+        """Issue 3: Historical stale sessions are never automatically selected for recovery."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with patch("nulltrace.PERSISTENT_DIR", tmp_path), \
+                 patch("nulltrace.RUN_DIR", tmp_path):
+                # Create historical sessions
+                (tmp_path / "session_deadbeef0001").mkdir(parents=True, exist_ok=True)
+                (tmp_path / "session_deadbeef0002").mkdir(parents=True, exist_ok=True)
+
+                # No state.json -> must return None, NOT any historical session
+                self.assertIsNone(self.app._discover_session_id())
+
+                # Authoritative state.json is INACTIVE -> must return None
+                state_file = tmp_path / "state.json"
+                state_file.write_text(json.dumps({"state": nulltrace.STATE_INACTIVE, "session_id": "deadbeef0001"}), encoding="utf-8")
+                self.assertIsNone(self.app._discover_session_id())
+
+                # Authoritative state.json points to missing session dir -> raises RuntimeError
+                state_file.write_text(json.dumps({"state": nulltrace.STATE_ACTIVE, "session_id": "deadbeef9999"}), encoding="utf-8")
+                with self.assertRaises(RuntimeError) as ctx:
+                    self.app._discover_session_id()
+                self.assertIn("non-existent session directory", str(ctx.exception))
+
+    def test_issue4_session_identity_consistency_4way(self):
+        """Issue 4: Strict 4-way consistency check among directory, state.json, metadata.json, and manifest.json."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            sid = "aabbccddeeff"
+            sdir = tmp_path / f"session_{sid}"
+            sdir.mkdir(parents=True, exist_ok=True)
+
+            with patch("nulltrace.PERSISTENT_DIR", tmp_path), \
+                 patch("nulltrace.RUN_DIR", tmp_path):
+                state_file = tmp_path / "state.json"
+                state_file.write_text(json.dumps({"state": nulltrace.STATE_ACTIVE, "session_id": sid}), encoding="utf-8")
+
+                # Case A: metadata session_id mismatch
+                (sdir / "metadata.json").write_text(json.dumps({"session_id": "mismatched001"}), encoding="utf-8")
+                with self.assertRaises(RuntimeError) as ctx:
+                    self.app._load_session_metadata()
+                self.assertIn("session ID mismatch between metadata", str(ctx.exception))
+
+                # Case B: manifest session_id mismatch
+                (sdir / "metadata.json").write_text(json.dumps({"session_id": sid}), encoding="utf-8")
+                (sdir / "manifest.json").write_text(json.dumps({"session_id": "mismatched002"}), encoding="utf-8")
+                with self.assertRaises(RuntimeError) as ctx:
+                    self.app._load_session_metadata()
+                self.assertIn("session ID mismatch between manifest", str(ctx.exception))
+
+                # Case C: All match -> succeeds
+                (sdir / "manifest.json").write_text(json.dumps({"session_id": sid}), encoding="utf-8")
+                loaded = self.app._load_session_metadata()
+                self.assertIsNotNone(loaded)
+                self.assertEqual(loaded["session_id"], sid)
+
+    def test_issue5_jump_deactivation_requires_ownership_authentication(self):
+        """Issue 5: Jump rule removal requires ownership authentication of target chain; fails safely if unowned."""
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda n: f"/usr/sbin/{n}" if n == "iptables" else None), \
+             patch("nulltrace.run_trusted") as mock_run:
+            # Inspection of target chain NULLTRACE_OUTPUT returns rules without CHAIN_MARKER_COMMENT
+            mock_run.return_value = MagicMock(returncode=0, stdout="-A NULLTRACE_OUTPUT -j ACCEPT\n", stderr="")
+            with self.assertRaises(RuntimeError) as ctx:
+                self.app._deactivate_jump_rules()
+            self.assertIn("unauthenticated chain", str(ctx.exception))
+
+            # Ensure iptables -D OUTPUT -j NULLTRACE_OUTPUT was never called
+            for c in mock_run.call_args_list:
+                args = c.args[0]
+                if "-D" in args and "NULLTRACE_OUTPUT" in args:
+                    self.fail("Jump deletion was called on unauthenticated chain!")
+
+    def test_issue6_chain_absence_requires_positive_proof(self):
+        """Issue 6: iptables inspection errors (empty stderr, locks) must not be assumed as chain absence."""
+        # 1. rc=1 + empty stderr -> error
+        with patch("nulltrace.run_trusted", return_value=MagicMock(returncode=1, stdout="", stderr="")):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.app._authenticate_or_create_chain("/usr/sbin/iptables", "nat", nulltrace.CHAIN_NAT_OUTPUT)
+            self.assertIn("Refusing to create chain without positive confirmation of absence", str(ctx.exception))
+
+        # 2. xtables lock (code 4) -> error
+        with patch("nulltrace.run_trusted", return_value=MagicMock(returncode=4, stdout="", stderr="xtables locked")):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.app._authenticate_or_create_chain("/usr/sbin/iptables", "nat", nulltrace.CHAIN_NAT_OUTPUT)
+            self.assertIn("xtables locked", str(ctx.exception))
+
+        # 3. Explicit positive absence -> creates chain
+        with patch("nulltrace.run_trusted") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=1, stdout="", stderr="iptables: No chain/target/match by that name."),
+                MagicMock(returncode=0, stdout="", stderr=""),  # -N
+                MagicMock(returncode=0, stdout="", stderr=""),  # -A comment
+            ]
+            self.app._authenticate_or_create_chain("/usr/sbin/iptables", "nat", nulltrace.CHAIN_NAT_OUTPUT)
+            self.assertEqual(mock_run.call_count, 3)
+
+        # 4. _destroy_authenticated_chain on lock error -> error
+        with patch("nulltrace.run_trusted", return_value=MagicMock(returncode=4, stdout="", stderr="xtables locked")):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.app._destroy_authenticated_chain("/usr/sbin/iptables", "nat", nulltrace.CHAIN_NAT_OUTPUT)
+            self.assertIn("Refusing destructive teardown", str(ctx.exception))
+
+    def test_issue7_service_actions_verify_postconditions(self):
+        """Issue 7: Tor service commands must verify resulting postconditions, not rely on command returncode 0."""
+        # 1. start returns 0, but process absent -> failure
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda n: f"/usr/bin/{n}" if n == "systemctl" else None), \
+             patch("nulltrace.run_trusted", return_value=MagicMock(returncode=0, stdout="", stderr="")), \
+             patch.object(self.app, "_has_verified_tor_process", return_value=False):
+            ok, detail = self.app._control_tor_service("start", check_listeners=False)
+            self.assertFalse(ok)
+            self.assertIn("post-condition failure", detail)
+
+        # 2. stop returns 0, but process remains alive -> failure
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda n: f"/usr/bin/{n}" if n == "systemctl" else None), \
+             patch("nulltrace.run_trusted", return_value=MagicMock(returncode=0, stdout="", stderr="")), \
+             patch.object(self.app, "_has_verified_tor_process", return_value=True):
+            ok, detail = self.app._control_tor_service("stop")
+            self.assertFalse(ok)
+            self.assertIn("still running", detail)
+
+        # 3. enable returns 0, but is-enabled says disabled -> failure
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda n: f"/usr/bin/{n}" if n == "systemctl" else None), \
+             patch("nulltrace.run_trusted", return_value=MagicMock(returncode=0, stdout="", stderr="")), \
+             patch.object(self.app, "_check_tor_service_enabled", return_value=False):
+            ok, detail = self.app._control_tor_service("enable")
+            self.assertFalse(ok)
+            self.assertIn("not enabled", detail)
+
+        # 4. disable returns 0, but is-enabled says enabled -> failure
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda n: f"/usr/bin/{n}" if n == "systemctl" else None), \
+             patch("nulltrace.run_trusted", return_value=MagicMock(returncode=0, stdout="", stderr="")), \
+             patch.object(self.app, "_check_tor_service_enabled", return_value=True):
+            ok, detail = self.app._control_tor_service("disable")
+            self.assertFalse(ok)
+            self.assertIn("not disabled", detail)
+
+    def test_issue8_control_port_zero_and_cookie_protection(self):
+        """Issue 8: ControlPort 0 returns 0 (never 9051); authentication cookie is never sent to unverified listener."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            torrc = Path(tmpdir) / "torrc"
+            torrc.write_text("ControlPort 0\nSOCKSPort 9050\n", encoding="utf-8")
+            self.app.config.tor_config = str(torrc)
+
+            # ControlPort 0 returns 0
+            self.assertEqual(self.app._read_control_port(), 0)
+
+            # When port is 0, _tor_control_newnym rejects immediately without opening sockets or cookie
+            with patch("nulltrace.CONTROL_COOKIE_PATHS", [Path(tmpdir) / "control_auth_cookie"]):
+                self.assertFalse(self.app._tor_control_newnym())
+
+            # ControlPort 9051 with unrelated listener -> rejects before cookie read
+            torrc.write_text("ControlPort 9051\n", encoding="utf-8")
+            with patch.object(self.app, "_verify_listener_ownership", return_value=False), \
+                 patch.object(Path, "read_bytes") as mock_read:
+                self.assertFalse(self.app._tor_control_newnym())
+                mock_read.assert_not_called()
+
+            # Protocol parser rejects non-250 and error replies
+            self.assertTrue(self.app._parse_tor_control_reply(b"250 OK\r\n"))
+            self.assertFalse(self.app._parse_tor_control_reply(b"515 Authentication failed\r\n"))
+            self.assertFalse(self.app._parse_tor_control_reply(b"451 Server error\r\n"))
+            self.assertFalse(self.app._parse_tor_control_reply(b""))
+
+    def test_issue9_tor_real_executable_security_verification(self):
+        """Issue 9: tor.real process receives identical trusted executable, UID, and permission verification as tor."""
+        with patch.object(self.app, "_tor_user", "109"), \
+             patch("pathlib.Path.is_dir", return_value=True), \
+             patch("pathlib.Path.exists", return_value=True), \
+             patch("pathlib.Path.read_text", return_value="Uid:\t109\t109\t109\t109\n"), \
+             patch("os.readlink", return_value="/usr/bin/tor.real"), \
+             patch("nulltrace.TRUSTED_BIN_DIRS", ("/usr/bin",)), \
+             patch("os.kill"):
+
+            # 1. Valid root-owned tor.real with mode 0755
+            stat_valid = MagicMock(st_mode=stat.S_IFREG | 0o755, st_uid=0)
+            with patch("os.stat", return_value=stat_valid), \
+                 patch("os.lstat", return_value=stat_valid), \
+                 patch("nulltrace.validate_trusted_directory_hierarchy", return_value=True):
+                self.assertTrue(self.app._verify_process_is_tor(12345))
+
+            # 2. Group-writable tor.real -> rejected
+            stat_gw = MagicMock(st_mode=stat.S_IFREG | 0o775, st_uid=0)
+            with patch("os.stat", return_value=stat_gw), \
+                 patch("os.lstat", return_value=stat_gw), \
+                 patch("nulltrace.validate_trusted_directory_hierarchy", return_value=True):
+                self.assertFalse(self.app._verify_process_is_tor(12345))
+
+            # 3. Non-root owned tor.real (UID 1000) -> rejected
+            stat_nonroot = MagicMock(st_mode=stat.S_IFREG | 0o755, st_uid=1000)
+            with patch("os.stat", return_value=stat_nonroot), \
+                 patch("os.lstat", return_value=stat_nonroot), \
+                 patch("nulltrace.validate_trusted_directory_hierarchy", return_value=True):
+                self.assertFalse(self.app._verify_process_is_tor(12345))
+
+            # 4. tor.real outside trusted directories -> rejected
+            with patch("os.readlink", return_value="/tmp/tor.real"):
+                self.assertFalse(self.app._verify_process_is_tor(12345))
+
+    def test_issue10_tor_config_restoration_post_verification(self):
+        """Issue 10: Tor configuration restoration verifies post-conditions (managed block stripped, permissions, backup integrity)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            torrc = tmp_path / "torrc"
+            torrc.write_text("# initial\n", encoding="utf-8")
+            self.app.config.tor_config = str(torrc)
+
+            with patch("nulltrace.PERSISTENT_DIR", tmp_path), \
+                 patch("nulltrace.RUN_DIR", tmp_path), \
+                 patch.object(self.app, "validate_tor_config_target", return_value=torrc):
+                sdir = tmp_path / f"session_{self.app.session_id}"
+                sdir.mkdir(parents=True, exist_ok=True)
+
+                 # Missing backup file when torrc initially existed raises RuntimeError
+                if torrc.exists():
+                    torrc.unlink()
+                meta = {
+                    "session_id": self.app.session_id,
+                    "baseline_captured": True,
+                    "tor_config_existed": True,
+                    "tor_service_initially_active": False,
+                }
+                (sdir / "metadata.json").write_text(json.dumps(meta), encoding="utf-8")
+                with self.assertRaises(RuntimeError) as ctx:
+                    self.app.restore_tor_config()
+                self.assertIn("baseline backup missing", str(ctx.exception))
+
+                # If restored torrc still contains managed block -> raises RuntimeError
+                (sdir / "torrc.bak").write_text("# baseline\n", encoding="utf-8")
+                torrc.write_text("## BEGIN nulltrace\nTransPort 9040\n## END nulltrace\n", encoding="utf-8")
+                with patch("nulltrace.strip_tor_config_blocks", return_value="## BEGIN nulltrace\nTransPort 9040\n## END nulltrace\n"):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        self.app.restore_tor_config()
+                    self.assertIn("Managed block still present in torrc after restore", str(ctx.exception))
+
+    def test_issue11_tor_active_unknown_aborts_mutation(self):
+        """Issue 11a: setup_network_rules aborts before mutation if Tor initial active state is UNKNOWN."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with patch("nulltrace.PERSISTENT_DIR", tmp_path), \
+                 patch("nulltrace.RUN_DIR", tmp_path), \
+                 patch("nulltrace.require_linux_root"), \
+                 patch.object(self.app, "_acquire_lock"), \
+                 patch.object(self.app, "_get_current_state", return_value=nulltrace.STATE_INACTIVE), \
+                 patch.object(self.app, "validate_network_config"), \
+                 patch.object(self.app, "validate_circuit_time"), \
+                 patch.object(self.app, "check_tor_service", return_value=None), \
+                 patch.object(self.app, "apply_tor_config") as mock_apply:
+                with self.assertRaises(RuntimeError) as ctx:
+                    self.app.setup_network_rules()
+                self.assertIn("Tor initial active state is UNKNOWN", str(ctx.exception))
+                mock_apply.assert_not_called()
+
+    def test_issue11_tor_enabled_unknown_aborts_mutation(self):
+        """Issue 11b: setup_network_rules aborts before mutation if Tor initial enabled state is UNKNOWN."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with patch("nulltrace.PERSISTENT_DIR", tmp_path), \
+                 patch("nulltrace.RUN_DIR", tmp_path), \
+                 patch("nulltrace.require_linux_root"), \
+                 patch.object(self.app, "_acquire_lock"), \
+                 patch.object(self.app, "_get_current_state", return_value=nulltrace.STATE_INACTIVE), \
+                 patch.object(self.app, "validate_network_config"), \
+                 patch.object(self.app, "validate_circuit_time"), \
+                 patch.object(self.app, "check_tor_service", return_value=False), \
+                 patch("nulltrace.resolve_trusted_binary", side_effect=lambda n: f"/usr/bin/{n}" if n == "systemctl" else None), \
+                 patch.object(self.app, "_check_tor_service_enabled", return_value=None), \
+                 patch.object(self.app, "apply_tor_config") as mock_apply:
+                with self.assertRaises(RuntimeError) as ctx:
+                    self.app.setup_network_rules()
+                self.assertIn("Tor initial enabled state is UNKNOWN", str(ctx.exception))
+                mock_apply.assert_not_called()
+
+    def test_issue11_interface_up_unknown_aborts_mutation(self):
+        """Issue 11c: setup_network_rules aborts before mutation if MAC administrative state is UNKNOWN."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            self.app.mac_randomize = True
+            with patch("nulltrace.PERSISTENT_DIR", tmp_path), \
+                 patch("nulltrace.RUN_DIR", tmp_path), \
+                 patch("nulltrace.require_linux_root"), \
+                 patch.object(self.app, "_acquire_lock"), \
+                 patch.object(self.app, "_get_current_state", return_value=nulltrace.STATE_INACTIVE), \
+                 patch.object(self.app, "validate_network_config"), \
+                 patch.object(self.app, "validate_circuit_time"), \
+                 patch.object(self.app, "check_tor_service", return_value=False), \
+                 patch.object(self.app, "_check_tor_service_enabled", return_value=False), \
+                 patch.object(self.app, "_get_primary_interface", return_value="eth0"), \
+                 patch.object(self.app, "_read_current_mac", return_value="00:11:22:33:44:55"), \
+                 patch.object(self.app, "_is_interface_up", return_value=None), \
+                 patch.object(self.app, "_randomize_mac") as mock_rand:
+                with self.assertRaises(RuntimeError) as ctx:
+                    self.app.setup_network_rules()
+                self.assertIn("Could not verify initial administrative state", str(ctx.exception))
+                mock_rand.assert_not_called()
+
+    def test_issue12_mac_randomization_uses_captured_interface(self):
+        """Issue 12: MAC randomization strictly uses captured interface even if routing changes; fails safely if disappeared."""
+        self.app.mac_randomize = True
+        self.app._spoofed_intf = "eth0"
+        self.app._original_mac = "00:11:22:33:44:55"
+        self.app._interface_initially_up = True
+
+        with patch("nulltrace.require_trusted_binary", side_effect=lambda n: f"/usr/sbin/{n}"), \
+             patch("nulltrace.resolve_trusted_binary", side_effect=lambda n: f"/usr/sbin/{n}"), \
+             patch("nulltrace.run_trusted") as mock_run, \
+             patch.object(self.app, "_renew_dhcp"), \
+             patch("pathlib.Path.exists", return_value=True):
+
+            # If default route changes to tun0, _randomize_mac still operates strictly on captured eth0
+            with patch.object(self.app, "_get_primary_interface", return_value="tun0"):
+                self.app._randomize_mac()
+
+            executed_cmds = [call.args[0] for call in mock_run.call_args_list]
+            self.assertIn(["/usr/sbin/ip", "link", "set", "eth0", "down"], executed_cmds)
+            self.assertNotIn(["/usr/sbin/ip", "link", "set", "tun0", "down"], executed_cmds)
+
+        # If captured eth0 sysfs disappeared, abort safely without switching interface
+        def exists_filter(p, *args, **kwargs):
+            if "eth0" in str(p):
+                return False
+            return True
+
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda n: f"/usr/sbin/{n}"), \
+             patch.object(Path, "exists", autospec=True, side_effect=exists_filter), \
+             patch.object(self.app, "_get_primary_interface", return_value="eth1"), \
+             patch.object(nulltrace.os, "_force_posix_security_checks", True, create=True):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.app._randomize_mac()
+            self.assertIn("is no longer available", str(ctx.exception))
+
+    def test_issue1_service_process_ambiguity_returns_none(self):
+        """Issue 1 & 7: Ambiguous evidence between service manager and process returns UNKNOWN (None)."""
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda n: f"/bin/{n}"):
+            # Case 1: systemctl reports active, but no process found -> None
+            with patch("nulltrace.run_trusted") as mock_run, \
+                 patch.object(self.app, "_has_verified_tor_process", return_value=False):
+                mock_run.return_value = subprocess.CompletedProcess(args=["systemctl"], returncode=0, stdout="active\n", stderr="")
+                status, detail = self.app._control_tor_service("is-active")
+                self.assertIsNone(status)
+                self.assertIn("Ambiguous Tor state", detail)
+                self.assertIsNone(self.app.check_tor_service())
+
+            # Case 2: systemctl reports inactive (code 3), but process found -> None
+            with patch("nulltrace.run_trusted") as mock_run, \
+                 patch.object(self.app, "_has_verified_tor_process", return_value=True):
+                mock_run.return_value = subprocess.CompletedProcess(args=["systemctl"], returncode=3, stdout="inactive\n", stderr="")
+                status, detail = self.app._control_tor_service("is-active")
+                self.assertIsNone(status)
+                self.assertIn("Ambiguous Tor state", detail)
+                self.assertIsNone(self.app.check_tor_service())
+
+    def test_issue2_restore_mac_requires_boolean_interface_up(self):
+        """Issue 2: _restore_mac refuses to invent administrative state when missing or non-boolean."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with patch("nulltrace.PERSISTENT_DIR", tmp_path), \
+                 patch("nulltrace.RUN_DIR", tmp_path):
+                sdir = tmp_path / f"session_{self.app.session_id}"
+                sdir.mkdir(parents=True, exist_ok=True)
+                meta = {
+                    "session_id": self.app.session_id,
+                    "baseline_captured": True,
+                    "spoofed_intf": "eth0",
+                    "original_mac": "00:11:22:33:44:55",
+                    "interface_initially_up": None,
+                }
+                (sdir / "metadata.json").write_text(json.dumps(meta), encoding="utf-8")
+                self.app._interface_initially_up = None
+                with patch.object(self.app, "_read_current_mac", return_value="00:11:22:33:44:55"), \
+                     patch("nulltrace.require_trusted_binary", return_value="/usr/sbin/ip"), \
+                     patch("nulltrace.run_trusted"):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        self.app._restore_mac()
+                    self.assertIn("interface_initially_up", str(ctx.exception))
+                    self.assertIn("RESTORE_FAILED", str(ctx.exception))
+
+    def test_issue12_mac_randomization_refuses_uncaptured_baseline(self):
+        """Issue 12: _randomize_mac aborts immediately without mutation if baseline was not captured."""
+        self.app.mac_randomize = True
+        self.app._spoofed_intf = "eth0"
+        self.app._original_mac = None
+        self.app._interface_initially_up = None
+        with self.assertRaises(RuntimeError) as ctx:
+            self.app._randomize_mac()
+        self.assertIn("not captured", str(ctx.exception).lower())
+
+        # Also when original MAC is set but interface_initially_up is UNKNOWN
+        self.app._original_mac = "00:11:22:33:44:55"
+        self.app._interface_initially_up = None
+        with patch.object(self.app, "_is_interface_up", return_value=None):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.app._randomize_mac()
+            self.assertIn("could not determine whether interface", str(ctx.exception).lower())
+
+    def test_issue8_control_reply_strict_status_validation(self):
+        """Issue 8: _parse_tor_control_reply strictly validates status code 250 on all lines."""
+        # Non-250 status code rejected
+        self.assertFalse(self.app._parse_tor_control_reply(b"550 Permission denied\r\n"))
+
+        # Mixed codes rejected
+        self.assertFalse(self.app._parse_tor_control_reply(b"250-OK\r\n251 Something\r\n250 OK\r\n"))
+
+        # Valid single-line reply accepted
+        self.assertTrue(self.app._parse_tor_control_reply(b"250 OK\r\n"))
+
+        # Valid multi-line reply accepted
+        self.assertTrue(self.app._parse_tor_control_reply(b"250-OK\r\n250 OK\r\n"))
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

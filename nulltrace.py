@@ -905,13 +905,16 @@ class nulltrace:
         self._spoofed_intf: Optional[str] = None
         self._original_mac: Optional[str] = None
         self._tor_user: Optional[str] = None
-        self._session_id: str = uuid.uuid4().hex[:12]
+        self._session_id: Optional[str] = None
+        self._session_explicitly_bound: bool = False
         self._session_created_at: Optional[str] = None
         self._current_state: str = STATE_INACTIVE
         self._rollback_registered = False
         self._restore_failures: List[str] = []
         self._tor_file_restored: bool = False
         self._tor_service_restored: bool = False
+        self._tor_config_applied: bool = False
+        self._mac_randomized: bool = False
 
         self.setup_logging(verbose)
         self.tor_config_content = self.generate_tor_config(self.circuit_time)
@@ -921,63 +924,36 @@ class nulltrace:
         if not is_valid_session_id(session_id):
             raise ValueError(f"Invalid session ID format: '{session_id}'. Must be a valid session identifier.")
         self._session_id = session_id
+        self._session_explicitly_bound = True
 
     def _discover_session_id(self) -> Optional[str]:
         """
-        Discover active or uncleaned recoverable session ID from persistent state or session directory (P0.1, P1.2, P2-3).
-        Only sessions in RECOVERABLE_STATES are considered.
-        Historical INACTIVE sessions are never selected for recovery.
+        Discover active or uncleaned recoverable session ID from persistent state (Section 4, Section 5).
+        Only the authoritative current session referenced by state.json is considered.
+        Stale historical sessions in /var/lib/nulltrace/ are NEVER selected for automatic recovery.
         """
-        # 1. State files
+        # 1. Authoritative state files
         for sf in (PERSISTENT_DIR / "state.json", RUN_DIR / "state.json"):
             if sf.exists():
                 try:
                     data = json.loads(sf.read_text(encoding="utf-8"))
-                    sid = data.get("session_id")
-                    st = data.get("state")
-                    if st == STATE_INACTIVE:
-                        # Authoritative state is INACTIVE: current system is clean, never select stale historical sessions (Section 4)
-                        return None
-                    if sid and is_valid_session_id(sid) and (st in RECOVERABLE_STATES or data.get("active")):
-                        if (PERSISTENT_DIR / f"session_{sid}").exists() or sf == (PERSISTENT_DIR / "state.json"):
-                            return sid
-                except (OSError, json.JSONDecodeError):
-                    pass
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(f"Authoritative state file '{sf}' is corrupt or unreadable: {exc}")
+                if not isinstance(data, dict):
+                    raise RuntimeError(f"Authoritative state file '{sf}' is corrupt: expected JSON object")
+                st = data.get("state")
+                if st == STATE_INACTIVE:
+                    # Authoritative state is INACTIVE: current system is clean, never select stale historical sessions (Section 4)
+                    return None
+                sid = data.get("session_id")
+                if not sid or not is_valid_session_id(sid):
+                    raise RuntimeError(f"Recovery failed: state file '{sf}' contains invalid or missing session_id: {sid}")
+                sdir = PERSISTENT_DIR / f"session_{sid}"
+                if not sdir.is_dir():
+                    raise RuntimeError(f"Recovery failed: state file points to non-existent session directory '{sdir}'")
+                return sid
 
-        # 2. Session directory candidates with deterministic priority (only recoverable states)
-        if PERSISTENT_DIR.exists():
-            state_priority = {
-                STATE_ACTIVE: 6,
-                STATE_RESTORE_FAILED: 5,
-                STATE_RECOVERY_REQUIRED: 4,
-                STATE_PREPARING: 3,
-                STATE_ACTIVATING: 3,
-                STATE_RESTORING: 2,
-            }
-            parsed_candidates = []
-            for c in PERSISTENT_DIR.glob("session_*"):
-                meta = c / "metadata.json"
-                if meta.exists():
-                    try:
-                        mdata = json.loads(meta.read_text(encoding="utf-8"))
-                        st = mdata.get("state")
-                        if st in state_priority or mdata.get("active"):
-                            prio = state_priority.get(st, 1)
-                            created_str = mdata.get("created_at", "")
-                            mtime = c.stat().st_mtime if c.exists() else 0
-                            sid = c.name.replace("session_", "")
-                            if not is_valid_session_id(sid):
-                                continue
-                            if c.name != f"session_{sid}":
-                                continue
-                            parsed_candidates.append((prio, created_str, mtime, sid))
-                    except (OSError, json.JSONDecodeError):
-                        pass
-            if parsed_candidates:
-                # Sort newest/highest priority first, tie-break by sid
-                parsed_candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3]), reverse=True)
-                return parsed_candidates[0][3]
-
+        # No authoritative state file: system is clean or uninitialized; do NOT guess historical sessions
         return None
 
     @property
@@ -1397,67 +1373,77 @@ class nulltrace:
 
     def _load_session_metadata(self) -> Optional[Dict[str, Any]]:
         """
-        Load session metadata and bind recovery session identity (P0.1, Section 3, Section 5).
+        Load session metadata and bind recovery session identity (Section 3, Section 4, Section 5).
         Validates cross-record session ID consistency between metadata, manifest, state.json,
-        and session directory. Rejects corrupted metadata files explicitly.
+        and session directory. Rejects corrupted or inconsistent metadata files explicitly.
         """
+        # 1. Authoritative state file discovery first (Section 4)
         sid = self._discover_session_id()
-        if sid:
-            self._session_id = sid
-            meta_file = PERSISTENT_DIR / f"session_{sid}" / "metadata.json"
-            if meta_file.exists():
+        if not sid:
+            # Fall back to bound session or current session instance only if state.json does not exist (e.g. unit test mocks)
+            cur_sid = getattr(self, "_session_id", None)
+            if cur_sid and is_valid_session_id(cur_sid) and (PERSISTENT_DIR / f"session_{cur_sid}" / "metadata.json").exists():
+                sid = cur_sid
+            elif getattr(self, "_session_explicitly_bound", False) and cur_sid:
+                sid = cur_sid
+            else:
+                return None
+
+        self._session_id = sid
+        sdir = PERSISTENT_DIR / f"session_{sid}"
+        if sdir.name != f"session_{sid}":
+            raise RuntimeError(f"Recovery failed: session directory basename mismatch '{sdir.name}' vs 'session_{sid}'")
+
+        meta_file = sdir / "metadata.json"
+        if not meta_file.exists():
+            raise RuntimeError(f"Recovery failed: session metadata file '{meta_file}' is missing (RECOVERY_REQUIRED)")
+
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Recovery failed: session metadata file '{meta_file}' is corrupt or unreadable: {exc}")
+
+        if not isinstance(meta, dict):
+            raise RuntimeError(f"Recovery failed: session metadata file '{meta_file}' is corrupt: expected JSON object")
+
+        meta_sid = meta.get("session_id")
+        if not meta_sid or meta_sid != sid:
+            raise RuntimeError(
+                f"Recovery failed: session ID mismatch between metadata ({meta_sid}) and directory ({sid})"
+            )
+
+        # Cross-validate state.json if present
+        for sf in (PERSISTENT_DIR / "state.json", RUN_DIR / "state.json"):
+            if sf.exists():
                 try:
-                    meta = json.loads(meta_file.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError) as exc:
-                    raise RuntimeError(f"Recovery failed: session metadata file '{meta_file}' is corrupt or unreadable: {exc}")
-
-                meta_sid = meta.get("session_id")
-                if meta_sid and meta_sid != sid:
-                    raise RuntimeError(
-                        f"Recovery failed: session ID mismatch between metadata ({meta_sid}) and directory ({sid})"
-                    )
-
-                manifest_file = PERSISTENT_DIR / f"session_{sid}" / "manifest.json"
-                if manifest_file.exists():
-                    try:
-                        man = json.loads(manifest_file.read_text(encoding="utf-8"))
-                        man_sid = man.get("session_id")
-                        if man_sid and man_sid != sid:
+                    s_data = json.loads(sf.read_text(encoding="utf-8"))
+                    if isinstance(s_data, dict):
+                        state_sid = s_data.get("session_id")
+                        if state_sid and state_sid != sid:
                             raise RuntimeError(
-                                f"Recovery failed: session ID mismatch between manifest ({man_sid}) and directory ({sid})"
+                                f"Recovery failed: session ID mismatch between state.json ({state_sid}) and directory ({sid})"
                             )
-                    except (OSError, json.JSONDecodeError) as exc:
-                        raise RuntimeError(f"Recovery failed: session manifest file '{manifest_file}' is corrupt: {exc}")
-
-                return meta
-
-            # If session directory metadata doesn't exist, check state.json for fallback info
-            for sf in (PERSISTENT_DIR / "state.json", RUN_DIR / "state.json"):
-                if sf.exists():
-                    try:
-                        state_info = json.loads(sf.read_text(encoding="utf-8"))
-                        if state_info.get("session_id") == sid:
-                            return state_info
-                    except (OSError, json.JSONDecodeError):
-                        pass
-
-        # 2. Fallback: look in current session directory
-        if self._session_id:
-            sdir = self._session_dir()
-            meta_file = sdir / "metadata.json"
-            if meta_file.exists():
-                try:
-                    meta = json.loads(meta_file.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError) as exc:
-                    raise RuntimeError(f"Recovery failed: session metadata file '{meta_file}' is corrupt: {exc}")
-                meta_sid = meta.get("session_id")
-                if meta_sid and meta_sid != self._session_id:
-                    raise RuntimeError(
-                        f"Recovery failed: session ID mismatch between metadata ({meta_sid}) and session ({self._session_id})"
-                    )
-                return meta
+                    raise RuntimeError(f"Recovery failed: state file '{sf}' is corrupt: {exc}")
 
-        return None
+        # Cross-validate manifest.json if present
+        manifest_file = sdir / "manifest.json"
+        if manifest_file.exists():
+            try:
+                man = json.loads(manifest_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"Recovery failed: session manifest file '{manifest_file}' is corrupt: {exc}")
+
+            if not isinstance(man, dict):
+                raise RuntimeError(f"Recovery failed: session manifest file '{manifest_file}' is corrupt: expected JSON object")
+
+            man_sid = man.get("session_id")
+            if not man_sid or man_sid != sid:
+                raise RuntimeError(
+                    f"Recovery failed: session ID mismatch between manifest ({man_sid}) and directory ({sid})"
+                )
+
+        return meta
 
     def _generate_enforcement_manifest(self) -> Dict[str, Any]:
         """
@@ -2109,16 +2095,17 @@ class nulltrace:
                                 return True
                         except (ValueError, OSError):
                             continue
-            except OSError:
-                pass
+            except (OSError, PermissionError):
+                raise
         return False
 
     def _control_tor_service(self, action: str, check_listeners: Optional[bool] = None) -> Tuple[Optional[bool], str]:
         """
         Tor service control with post-condition verification (Section 2, Section 8, NT-012, NT-006, P1.6, NT-02).
         For is-active: returns (True, ...) if active with verified process, (False, ...) if confirmed inactive,
-        or (None, ...) if unknown/inaccessible.
-        For stop: verifies verified Tor process is stopped afterwards.
+        or (None, ...) if unknown/inaccessible. Never collapses UNKNOWN into False.
+        For stop: verifies verified Tor process is stopped and listeners are closed.
+        For start/restart: verifies process exists and listeners are functional.
         For enable/disable: verifies is-enabled status matches.
         """
         errors: List[str] = []
@@ -2127,12 +2114,26 @@ class nulltrace:
         service_bin = resolve_trusted_binary("service")
 
         if action == "is-active":
-            proc_accessible = Path("/proc").is_dir() if (os.name != "nt" or getattr(os, "_force_posix_security_checks", False)) else True
-            if not proc_accessible:
-                return None, "/proc is inaccessible; cannot verify Tor process identity"
+            proc_root = Path("/proc")
+            if (os.name != "nt" or getattr(os, "_force_posix_security_checks", False)):
+                if not proc_root.is_dir():
+                    return None, "/proc is inaccessible; cannot verify Tor process identity"
+
+            proc_verified = False
+            proc_error = None
+            try:
+                proc_verified = self._has_verified_tor_process()
+            except Exception as exc:
+                proc_error = str(exc)
+
+            if proc_error:
+                return None, f"/proc inspection failed: {proc_error}"
 
             # 1. Attempt systemctl if available
             manager_checked = False
+            manager_confirmed_inactive = False
+            ambiguous_evidence = False
+
             if systemctl_bin:
                 for svc in ("tor@default", "tor"):
                     try:
@@ -2142,24 +2143,28 @@ class nulltrace:
                             text=True,
                             check=False,
                         )
-                        rc_ok = (res.returncode == 0) if isinstance(res.returncode, int) else True
-                        if rc_ok:
+                        rc = res.returncode if isinstance(res.returncode, int) else 0
+                        out = (res.stdout or "").strip().lower()
+                        err = (res.stderr or "").strip().lower()
+
+                        if rc == 0:
                             manager_checked = True
-                            out = res.stdout if isinstance(res.stdout, str) else ""
-                            if "active" in out.strip() and "exited" not in out:
-                                if self._has_verified_tor_process():
+                            if ("active" in out or "running" in out) and "not running" not in out and "exited" not in out:
+                                if proc_verified:
                                     return True, f"systemctl {action} {svc} succeeded with verified Tor daemon"
+                                # Service manager says active, but process verification found NO verified daemon -> NT-02
                                 errors.append(f"systemctl {action} {svc} reported active but no verified Tor daemon process was found")
                         else:
-                            out = (res.stdout or "").strip().lower()
-                            err = (res.stderr or "").strip().lower()
-                            if "inactive" in out or "failed" in out or res.returncode == 3 or "could not be found" in err:
+                            # Non-zero exit code: check if it positively confirms inactive
+                            if "inactive" in out or "failed" in out or rc in (3, 4) or "could not be found" in err or "unit " in err:
                                 manager_checked = True
+                                manager_confirmed_inactive = True
+                            else:
+                                errors.append(f"systemctl {action} {svc} returned unexpected error (code {rc}): {err or out}")
                     except OSError as exc:
                         errors.append(f"systemctl {action} {svc}: {exc}")
 
-            # 2. Fallback to service utility
-            if service_bin:
+            if not manager_checked and service_bin:
                 for svc in ("tor@default", "tor"):
                     try:
                         res = run_trusted(
@@ -2168,25 +2173,41 @@ class nulltrace:
                             text=True,
                             check=False,
                         )
-                        rc_ok = (res.returncode == 0) if isinstance(res.returncode, int) else True
-                        if rc_ok:
+                        rc = res.returncode if isinstance(res.returncode, int) else 0
+                        out = (res.stdout or "").strip().lower()
+                        err = (res.stderr or "").strip().lower()
+                        if rc == 0:
                             manager_checked = True
-                            if self._has_verified_tor_process():
+                            if proc_verified:
                                 return True, f"service {svc} status succeeded with verified Tor daemon"
                             errors.append(f"service {svc} status reported active but no verified Tor daemon process was found")
                         else:
-                            manager_checked = True
+                            if "inactive" in out or "stopped" in out or "not running" in out or rc in (3, 4):
+                                manager_checked = True
+                                manager_confirmed_inactive = True
+                            else:
+                                errors.append(f"service {svc} status returned unexpected error: {err or out}")
                     except OSError as exc:
                         errors.append(f"service {svc} status: {exc}")
 
-            # 3. If verified Tor process is running
-            if self._has_verified_tor_process():
+            # Conflicting / ambiguous evidence: manager reported inactive but process is running -> UNKNOWN (None)
+            if manager_confirmed_inactive and proc_verified:
+                return None, "Ambiguous Tor state: verified Tor daemon process running but service manager reported inactive"
+
+            # 3. If verified Tor process is running (and manager is active or not available)
+            if proc_verified:
                 return True, "Verified Tor daemon process running"
 
-            if errors:
-                return False, "; ".join(errors)
+            # Conflicting / ambiguous evidence: service manager reported active but no verified process found -> UNKNOWN (None) (Section 2)
+            if any("no verified Tor daemon process was found" in e for e in errors):
+                return None, f"Ambiguous Tor state: service manager reported active but no verified Tor daemon process was found: {'; '.join(errors)}"
 
-            if manager_checked:
+            # Any service-manager or inspection errors -> UNKNOWN (None)
+            if errors:
+                return None, f"Tor service state cannot be determined (UNKNOWN): {'; '.join(errors)}"
+
+            # Only when process is confirmed absent AND service manager positively confirmed inactive
+            if manager_checked and manager_confirmed_inactive:
                 return False, "Tor daemon is not running and service manager reported inactive"
 
             return None, "Tor service state cannot be determined (UNKNOWN): neither systemctl nor service verified state"
@@ -2240,10 +2261,27 @@ class nulltrace:
         # Post-condition verification (Section 8)
         if action == "stop":
             for _ in range(10):
-                if not self._has_verified_tor_process():
-                    return True, "Tor service stop succeeded and process terminated"
+                proc_alive = False
+                try:
+                    proc_alive = self._has_verified_tor_process()
+                except Exception:
+                    proc_alive = False
+
+                # Verify Tor listeners on TransPort are gone
+                listener_alive = False
+                try:
+                    with socket.create_connection((self.config.localhost, int(self.config.tor_port)), timeout=0.2):
+                        listener_alive = True
+                except (OSError, ValueError):
+                    pass
+
+                if not proc_alive and not listener_alive:
+                    return True, "Tor service stop succeeded and process/listeners terminated"
                 time.sleep(0.2)
-            return False, "Tor service stop command executed but verified Tor process is still running"
+
+            if proc_alive:
+                return False, "Tor service stop command executed but verified Tor process is still running"
+            return False, "Tor service stop command executed but Tor listener port is still active"
 
         if action == "enable":
             st_en = self._check_tor_service_enabled()
@@ -2259,11 +2297,14 @@ class nulltrace:
 
         if action in ("start", "restart"):
             verified_proc = False
-            for _ in range(10):
-                if self._has_verified_tor_process():
-                    verified_proc = True
-                    break
-                time.sleep(0.1)
+            for _ in range(15):
+                try:
+                    if self._has_verified_tor_process():
+                        verified_proc = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.2)
             if not verified_proc:
                 return False, f"Tor service {action} command executed but verified Tor process was not found (post-condition failure)"
 
@@ -2356,12 +2397,27 @@ class nulltrace:
         except OSError:
             return False
 
-        target_path = Path(target_exe)
-        target_posix = target_path.as_posix()
+        if target_exe.endswith(" (deleted)"):
+            target_exe = target_exe[:-10]
 
-        if target_path.name not in ("tor", "tor.real"):
+        target_path = Path(target_exe)
+        try:
+            resolved_target = target_path.resolve()
+        except OSError:
             return False
 
+        if target_path.name not in ("tor", "tor.real") or resolved_target.name not in ("tor", "tor.real"):
+            return False
+
+        # Trusted directory containment for both path and resolved target (Section 9, Section 10)
+        resolved_posix = re.sub(r"^[a-zA-Z]:", "", resolved_target.as_posix())
+        target_posix = re.sub(r"^[a-zA-Z]:", "", target_path.as_posix())
+
+        if not any(
+            resolved_posix == f"{tdir}/{resolved_target.name}" or resolved_posix.startswith(f"{tdir}/")
+            for tdir in TRUSTED_BIN_DIRS
+        ):
+            return False
         if not any(
             target_posix == f"{tdir}/{target_path.name}" or target_posix.startswith(f"{tdir}/")
             for tdir in TRUSTED_BIN_DIRS
@@ -2369,19 +2425,20 @@ class nulltrace:
             return False
 
         try:
-            st = os.stat(target_posix)
+            st = os.stat(str(resolved_target))
+            lst = os.lstat(str(target_path))
             if not stat.S_ISREG(st.st_mode):
                 return False
-            if (os.name != "nt" or getattr(os, "_force_posix_security_checks", False)):
-                if st.st_mode & 0o022:
-                    return False
-                if hasattr(st, "st_uid") and st.st_uid != 0:
-                    return False
-                if not validate_trusted_directory_hierarchy(target_path):
-                    return False
-        except OSError:
-            if os.name != "nt":
+            # Root ownership check (P1-5, Section 10)
+            if (hasattr(st, "st_uid") and st.st_uid != 0) or (hasattr(lst, "st_uid") and lst.st_uid != 0):
                 return False
+            # Reject group-writable and world-writable (Section 10)
+            if (hasattr(st, "st_mode") and (st.st_mode & 0o022)) or (hasattr(lst, "st_mode") and (lst.st_mode & 0o022)):
+                return False
+            if not validate_trusted_directory_hierarchy(resolved_target) or not validate_trusted_directory_hierarchy(target_path):
+                return False
+        except OSError:
+            return False
 
         # 3. Liveness check to avoid PID recycle
         try:
@@ -2677,29 +2734,31 @@ class nulltrace:
 
         new_content = existing + self.tor_config_content
         atomic_write(path, new_content)
+        self._tor_config_applied = True
         self._restart_tor()
 
     def restore_tor_config(self) -> None:
         """
-        Restore Tor configuration preserving administrator changes (Section 2, 3, 10, 28, 29, 32, NT-010, NT-014, NT-015, P1.3, P1-9, P1-10, P2.4).
+        Restore Tor configuration preserving administrator changes (Section 2, 3, 10, 11).
         Strips only the nulltrace-managed block from the live torrc file.
         Restores original file existence and Tor service state.
+        Proves restoration success before setting _tor_file_restored = True.
         """
         sdir = self._session_dir()
         backup_path = sdir / "torrc.bak"
         path = self.validate_tor_config_target(self.config.tor_config)
 
         meta = self._load_session_metadata() or {}
-        baseline_captured = meta.get("baseline_captured", getattr(self, "_baseline_captured", False))
         tor_config_existed = meta.get("tor_config_existed", getattr(self, "_tor_config_existed", None))
 
-        if baseline_captured and tor_config_existed is None:
+        if tor_config_existed is None or not isinstance(tor_config_existed, bool):
             self._tor_file_restored = False
-            raise RuntimeError("Cannot restore Tor configuration: 'tor_config_existed' was missing from captured baseline")
+            raise RuntimeError(
+                "Cannot restore Tor configuration: 'tor_config_existed' is missing, invalid, or UNKNOWN in baseline (RESTORE_FAILED)"
+            )
 
-        # Section 10 & 32: baseline config restoration
         if tor_config_existed is False:
-            # File did not exist initially (P1-9, Section 10)
+            # File did not exist initially (Section 10, Section 11)
             if path.exists():
                 current_content = path.read_text(encoding="utf-8")
                 cleaned = strip_tor_config_blocks(current_content) if torrc_has_managed_block(current_content) else current_content
@@ -2708,20 +2767,28 @@ class nulltrace:
                         path.unlink()
                     except OSError as exc:
                         self._tor_file_restored = False
-                        raise RuntimeError(f"Failed to remove newly created Tor config file: {exc}")
+                        raise RuntimeError(f"Failed to remove newly created Tor config file: {exc} (RESTORE_FAILED)")
                 else:
                     # Admin added settings outside managed block -> preserve admin changes
                     atomic_write(path, cleaned)
 
-            # Verify post-condition (Section 32)
+            # Verify post-condition (Section 11)
             if path.exists():
                 post_content = path.read_text(encoding="utf-8")
                 if torrc_has_managed_block(post_content):
                     self._tor_file_restored = False
-                    raise RuntimeError("Managed block still present in torrc after restore")
+                    raise RuntimeError("Managed block still present in torrc after restore (RESTORE_FAILED)")
+                if not strip_tor_config_blocks(post_content).strip():
+                    self._tor_file_restored = False
+                    raise RuntimeError("Tor config file still exists after restore when it should have been removed (RESTORE_FAILED)")
             self._tor_file_restored = True
         else:
-            # tor_config_existed is True or None (unspecified / test mock)
+            # tor_config_existed is True: baseline backup is strictly mandatory (Section 10, Section 11)
+            has_backup = backup_path.exists() or (meta.get("tor_config_backup") is not None)
+            if not has_backup:
+                self._tor_file_restored = False
+                raise RuntimeError(f"Tor config baseline backup missing: {backup_path} (RESTORE_FAILED)")
+
             if path.exists():
                 current_content = path.read_text(encoding="utf-8")
                 if torrc_has_managed_block(current_content):
@@ -2735,41 +2802,57 @@ class nulltrace:
                 # Live file was deleted during session: restore from backup
                 content = strip_tor_config_blocks(backup_path.read_text(encoding="utf-8"))
                 atomic_write(path, content)
-            elif tor_config_existed is True and baseline_captured:
-                self._tor_file_restored = False
-                raise RuntimeError(f"Tor config baseline backup missing: {backup_path}")
+            elif meta.get("tor_config_backup") is not None:
+                content = strip_tor_config_blocks(meta.get("tor_config_backup"))
+                atomic_write(path, content)
 
-            # Verify post-conditions (Section 32)
-            if tor_config_existed is True and baseline_captured and not path.exists():
+            # Verify post-conditions (Section 11)
+            if not path.exists():
                 self._tor_file_restored = False
-                raise RuntimeError(f"Tor config file '{path}' does not exist after restore")
+                raise RuntimeError(f"Tor config file '{path}' does not exist after restore (RESTORE_FAILED)")
+
             if path.exists():
                 post_content = path.read_text(encoding="utf-8")
                 if torrc_has_managed_block(post_content):
                     self._tor_file_restored = False
-                    raise RuntimeError("Managed block still present in torrc after restore")
+                    raise RuntimeError("Managed block still present in torrc after restore (RESTORE_FAILED)")
+
+                # Verify file permissions and ownership
+                if os.name != "nt" or getattr(os, "_force_posix_security_checks", False):
+                    try:
+                        st = os.stat(str(path))
+                        if hasattr(st, "st_uid") and st.st_uid != 0:
+                            self._tor_file_restored = False
+                            raise RuntimeError(f"Restored torrc file '{path}' is not root-owned (UID {st.st_uid})")
+                        if st.st_mode & 0o022:
+                            self._tor_file_restored = False
+                            raise RuntimeError(f"Restored torrc file '{path}' has insecure group/world writable permissions ({oct(st.st_mode)})")
+                    except OSError as exc:
+                        self._tor_file_restored = False
+                        raise RuntimeError(f"Cannot stat restored torrc file '{path}': {exc}")
+
             self._tor_file_restored = True
 
-        # Restore original Tor service state (Section 2, Section 3, Section 28, Section 29)
+        # Restore original Tor service state (Section 2, Section 3, Section 7, Section 8)
         tor_initially_active = meta.get("tor_service_initially_active", getattr(self, "_tor_initially_active", None))
         tor_initially_enabled = meta.get("tor_service_initially_enabled", getattr(self, "_tor_initially_enabled", None))
         tor_raw_enabled = meta.get("tor_service_raw_enabled_state", getattr(self, "_tor_service_raw_enabled_state", None))
 
-        if baseline_captured and tor_initially_active is None:
+        if tor_initially_active is None or not isinstance(tor_initially_active, bool):
             self._tor_service_restored = False
-            raise RuntimeError("Cannot restore Tor service state: initial active state was UNKNOWN or missing from captured baseline")
+            raise RuntimeError(
+                "Cannot restore Tor service state: 'tor_service_initially_active' is missing, invalid, or UNKNOWN in baseline (RESTORE_FAILED)"
+            )
 
-        if not baseline_captured and tor_initially_active is None:
-            tor_initially_active = True
+        action = "restart" if tor_initially_active else "stop"
+        ok, detail = self._control_tor_service(action)
+        if not ok:
+            self._tor_service_restored = False
+            raise RuntimeError(f"Tor configuration restored on disk, but Tor service {action} failed: {detail}")
 
-        if tor_initially_active is not None:
-            action = "restart" if tor_initially_active else "stop"
-            ok, detail = self._control_tor_service(action)
-            if not ok:
-                self._tor_service_restored = False
-                raise RuntimeError(f"Tor configuration restored on disk, but Tor service {action} failed: {detail}")
+        # Systemd enabled state restoration (Section 2, Section 3, Section 10)
+        # If tor_initially_enabled is None/UNKNOWN, leave state untouched (never enable or disable)
 
-        # Systemd enabled state restoration (Section 28 & 29)
         if tor_initially_enabled is False and tor_raw_enabled not in ("masked", "masked-runtime"):
             ok_dis, detail_dis = self._control_tor_service("disable")
             if not ok_dis:
@@ -2950,50 +3033,43 @@ class nulltrace:
         return None
 
     def _randomize_mac(self) -> None:
-        """Persist original hardware MAC and randomize using macchanger (Section 12, NT-011, P1-11, NT-09)."""
+        """Randomize MAC on captured baseline interface using macchanger (Section 11, Section 12, NT-011)."""
         macchanger_bin = resolve_trusted_binary("macchanger")
         if not macchanger_bin:
             raise RuntimeError(
                 "macchanger is not installed in trusted paths but --mac-randomize was requested. Aborting."
             )
 
-        # Section 12: Use baseline interface without re-discovering
+        # Section 12: Must strictly use captured baseline interface without re-discovery
         intf = getattr(self, "_spoofed_intf", None)
-        if intf:
+        if not intf:
+            raise RuntimeError(
+                "Cannot randomize MAC: target interface was not captured during baseline before mutation. Aborting."
+            )
+
+        if os.name != "nt" or getattr(os, "_force_posix_security_checks", False):
             intf_path = Path(f"/sys/class/net/{intf}")
             if not intf_path.exists():
                 raise RuntimeError(
-                    f"Baseline interface '{intf}' is no longer available. Refusing to switch interface."
+                    f"Captured baseline interface '{intf}' is no longer available. Refusing to switch interface."
                 )
-        else:
-            intf = self._get_primary_interface()
-            if not intf:
-                raise RuntimeError(
-                    "Could not determine primary network interface for MAC spoofing. Aborting."
-                )
-            self._spoofed_intf = intf
 
         original_mac = getattr(self, "_original_mac", None)
         if not original_mac:
-            original_mac = self._read_current_mac(intf)
-            if not original_mac:
-                raise RuntimeError(
-                    f"Could not read original hardware MAC for {intf}. Aborting to prevent permanent loss."
-                )
-            self._original_mac = original_mac
+            raise RuntimeError(
+                f"Cannot randomize MAC: original hardware MAC was not captured for '{intf}'. Aborting."
+            )
 
-        if getattr(self, "_interface_initially_up", None) is None:
-            intf_up = self._is_interface_up(intf)
-            if intf_up is None:
-                raise RuntimeError(
-                    f"Could not determine whether interface '{intf}' is administratively UP or DOWN. "
-                    "Refusing MAC randomization to prevent leaving interface in unverified administrative state."
-                )
-            self._interface_initially_up = intf_up
+        initially_up = getattr(self, "_interface_initially_up", None)
+        if initially_up is None or not isinstance(initially_up, bool):
+            raise RuntimeError(
+                f"Could not determine whether interface '{intf}' is administratively UP or DOWN. "
+                "Aborting MAC randomization to prevent unrecoverable network state."
+            )
 
         self._persist_session_metadata()
 
-        print(f"[*] Original MAC recorded: {original_mac} for interface: {intf} (initially UP: {self._interface_initially_up})")
+        print(f"[*] Original MAC recorded: {original_mac} for interface: {intf} (initially UP: {initially_up})")
         print(f"[*] Randomizing MAC address for interface: {intf}...")
 
         ip_bin = require_trusted_binary("ip")
@@ -3001,39 +3077,49 @@ class nulltrace:
             run_trusted([ip_bin, "link", "set", intf, "down"], check=True)
             run_trusted([macchanger_bin, "-r", intf], check=True)
             run_trusted([ip_bin, "link", "set", intf, "up"], check=True)
+            self._mac_randomized = True
             print("[+] MAC address randomized successfully. Renewing DHCP lease...")
             self._renew_dhcp(intf)
             time.sleep(4)
         except Exception as exc:
-            if getattr(self, "_interface_initially_up", None) is True:
+            if initially_up is True:
                 run_trusted([ip_bin, "link", "set", intf, "up"], check=False)
-            elif getattr(self, "_interface_initially_up", None) is False:
+            elif initially_up is False:
                 run_trusted([ip_bin, "link", "set", intf, "down"], check=False)
             self._restore_mac()
             raise RuntimeError(f"Failed to randomize MAC on {intf}: {exc}. Reverted.") from exc
 
     def _restore_mac(self) -> None:
-        """Restore original hardware MAC and administrative state independently of macchanger (Section 13, NT-011, P1-11, NT-09)."""
+        """Restore original hardware MAC and administrative state independently of macchanger (Section 2, 3, 12, 13)."""
         intf = self._spoofed_intf
         original_mac = self._original_mac
         initially_up = getattr(self, "_interface_initially_up", None)
         meta: Optional[Dict[str, Any]] = None
 
-        if not intf or not original_mac:
+        if not intf or not original_mac or initially_up is None:
             meta = self._load_session_metadata()
             if meta:
                 intf = intf or meta.get("spoofed_intf")
                 original_mac = original_mac or meta.get("original_mac")
-                if "interface_initially_up" in meta:
+                if "interface_initially_up" in meta and initially_up is None:
                     initially_up = meta["interface_initially_up"]
 
-        if not intf or not original_mac:
+        # If MAC randomization was not used in this session (neither attribute nor meta has spoofed_intf)
+        if not intf and not (meta and meta.get("spoofed_intf")):
             return
 
-        baseline_captured = meta.get("baseline_captured", getattr(self, "_baseline_captured", False)) if meta else getattr(self, "_baseline_captured", False)
-        if baseline_captured and initially_up is None:
+        # If spoofed_intf exists, MAC was spoofed -> ALL MAC baseline fields are strictly required (Section 3)
+        if not intf:
             self._mac_restored = False
-            raise RuntimeError(f"Cannot restore interface administrative state: 'interface_initially_up' is missing from captured baseline for {intf}")
+            raise RuntimeError("Cannot restore MAC: 'spoofed_intf' is missing from captured baseline (RESTORE_FAILED)")
+
+        if not original_mac:
+            self._mac_restored = False
+            raise RuntimeError(f"Cannot restore MAC for '{intf}': 'original_mac' is missing from captured baseline (RESTORE_FAILED)")
+
+        if initially_up is None or not isinstance(initially_up, bool):
+            self._mac_restored = False
+            raise RuntimeError(f"Cannot restore interface administrative state: 'interface_initially_up' is missing, invalid, or UNKNOWN in baseline for '{intf}' (RESTORE_FAILED)")
 
         print(f"[*] Restoring original MAC ({original_mac}) on interface {intf}...")
         ip_bin = require_trusted_binary("ip")
@@ -3055,9 +3141,9 @@ class nulltrace:
                 )
 
             current_up = self._is_interface_up(intf)
-            if current_up is None and initially_up is not None:
+            if current_up is None:
                 raise RuntimeError(f"Could not verify administrative UP/DOWN state for {intf} after restoration.")
-            if initially_up is not None and current_up != initially_up:
+            if current_up != initially_up:
                 raise RuntimeError(
                     f"Interface administrative UP/DOWN mismatch on {intf}: expected {initially_up}, got {current_up}"
                 )
@@ -3073,8 +3159,7 @@ class nulltrace:
             elif initially_up is False:
                 run_trusted([ip_bin, "link", "set", intf, "down"], check=False)
             raise RuntimeError(
-                f"Failed to restore original MAC {original_mac} on {intf}: {exc}. "
-                f"MANUAL ACTION: Run 'sudo ip link set dev {intf} address {original_mac}'"
+                f"Failed to restore original MAC {original_mac} on {intf}: {exc}. System state marked RESTORE_FAILED."
             ) from exc
 
     def _excluded_destinations(self) -> List[str]:
@@ -3082,7 +3167,7 @@ class nulltrace:
 
     def _authenticate_or_create_chain(self, iptables_bin: str, table: str, chain: str) -> None:
         """
-        Verify chain ownership before reusing or flushing (P1.7, NT-05).
+        Verify chain ownership before reusing or flushing (Section 6, Section 7, NT-05).
         Distinguishes positive chain absence from command/inspection errors.
         Rejects unauthenticated pre-existing chains to avoid flushing unrelated rules.
         Requires both chain name in ALL_OWNED_CHAINS and exact CHAIN_MARKER_COMMENT.
@@ -3092,9 +3177,17 @@ class nulltrace:
                 f"Firewall chain '{chain}' is not a recognized Nulltrace owned chain name. Refusing to operate."
             )
 
-        res = run_trusted([iptables_bin, "-t", table, "-S", chain], check=False)
+        try:
+            res = run_trusted([iptables_bin, "-t", table, "-S", chain], check=False)
+        except subprocess.CalledProcessError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"Firewall inspection error for chain '{chain}' in table '{table}': {exc}. "
+                "Refusing to create chain without positive confirmation of absence."
+            )
+
         if not isinstance(res.returncode, int):
-            # Unit test mock without returncode configured: treat as absent chain
             rc = 1
             err = "no chain/target/match by that name"
             out = ""
@@ -3106,15 +3199,12 @@ class nulltrace:
             out = (res.stdout or "").lower() if isinstance(res.stdout, str) else ""
 
         if rc == 0:
-            # Chain already exists. Authenticate ownership strictly by exact marker comment (Section 27)
             is_owned = is_chain_authenticated_nulltrace(lines.splitlines(), chain)
             if not is_owned:
                 raise RuntimeError(
                     f"Firewall chain '{chain}' in table '{table}' already exists and is not authenticated "
                     "as nulltrace-owned (missing exact ownership marker rule). Refusing to mutate or flush unrecognized chain."
                 )
-
-            # Authenticated: safe to flush and re-tag
             run_trusted([iptables_bin, "-t", table, "-F", chain], check=True)
             run_trusted([
                 iptables_bin, "-t", table, "-A", chain,
@@ -3122,8 +3212,7 @@ class nulltrace:
             ], check=True)
             return
 
-        # rc != 0: verify whether failure is positive chain absence vs inspection error (Section 7)
-        combined = f"{err} {out}"
+        combined = f"{err} {out}".strip()
         is_absent = any(sub in combined for sub in POSITIVE_ABSENCE_SUBSTRINGS)
         if not is_absent:
             err_msg = err.strip() or out.strip() or f"code {rc}"
@@ -3132,7 +3221,6 @@ class nulltrace:
                 "Refusing to create chain without positive confirmation of absence."
             )
 
-        # Chain confirmed absent: create it and tag with nulltrace comment
         run_trusted([iptables_bin, "-t", table, "-N", chain], check=True)
         run_trusted([
             iptables_bin, "-t", table, "-A", chain,
@@ -3380,7 +3468,15 @@ class nulltrace:
             run_trusted([ip6tables_bin, "-t", "mangle", "-I", "PREROUTING", "1", "-j", CHAIN_V6_MANGLE_PREROUTING], check=True)
 
     def _deactivate_jump_rules(self) -> None:
-        """Remove top-level jump rules to owned custom chains after authenticating chain ownership (Section 6, NT-003)."""
+        """
+        Remove top-level jump rules to owned custom chains after authenticating chain ownership (Section 5, Section 6, NT-003).
+        Sequence:
+        1. Identify target chain
+        2. Inspect target chain
+        3. Authenticate NullTrace ownership marker
+        4. Only then remove jump rule
+        If ownership cannot be established or inspection fails -> do not modify, raise RuntimeError (RECOVERY_REQUIRED).
+        """
         iptables_bin = resolve_trusted_binary("iptables")
         if iptables_bin:
             jumps_v4 = [
@@ -3392,25 +3488,44 @@ class nulltrace:
                 ("mangle", "PREROUTING", CHAIN_MANGLE_PREROUTING),
             ]
             for table, base, custom in jumps_v4:
-                res = run_trusted([iptables_bin, "-t", table, "-S", custom], check=False)
+                try:
+                    res = run_trusted([iptables_bin, "-t", table, "-S", custom], check=False)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Inspection error for chain {custom} in table {table}: {exc}. "
+                        f"Refusing to modify jump in {base}."
+                    )
                 if isinstance(res.returncode, int) and res.returncode == 0:
                     lines = (res.stdout or "").splitlines()
                     if not is_chain_authenticated_nulltrace(lines, custom):
                         raise RuntimeError(
-                            f"Refusing to remove jump from {base} to unauthenticated chain {custom} in table {table}"
+                            f"Refusing to remove jump from {base} to unauthenticated chain {custom} in table {table} "
+                            "(ownership cannot be established)"
                         )
+                    # Authenticated: safely remove jump rule
+                    for _ in range(5):
+                        res_del = run_trusted([iptables_bin, "-t", table, "-D", base, "-j", custom], check=False)
+                        if isinstance(res_del.returncode, int) and res_del.returncode != 0:
+                            combined_del = f"{res_del.stderr or ''} {res_del.stdout or ''}".lower()
+                            is_rule_absent = any(sub in combined_del for sub in (
+                                "bad rule", "does a matching rule exist", "no rule/chain/match", "does not exist", "not found"
+                            ))
+                            if not is_rule_absent and combined_del.strip():
+                                raise RuntimeError(
+                                    f"Failed to remove jump from {base} to {custom} in table {table} (code {res_del.returncode}): "
+                                    f"{res_del.stderr or res_del.stdout}. Refusing unverified jump teardown."
+                                )
+                            break
                 elif isinstance(res.returncode, int) and res.returncode != 0:
-                    combined = (res.stderr or "").lower() + " " + (res.stdout or "").lower()
+                    combined = f"{res.stderr or ''} {res.stdout or ''}".lower()
                     is_absent = any(sub in combined for sub in POSITIVE_ABSENCE_SUBSTRINGS)
                     if not is_absent:
                         raise RuntimeError(
                             f"Inspection error for chain {custom} in table {table} (code {res.returncode}): "
                             f"{res.stderr or res.stdout}. Refusing to modify jump in {base}."
                         )
-                for _ in range(5):
-                    res_del = run_trusted([iptables_bin, "-t", table, "-D", base, "-j", custom], check=False)
-                    if isinstance(res_del.returncode, int) and res_del.returncode != 0 and "does a matching rule exist" in (res_del.stderr or "").lower():
-                        break
+                    # Chain confirmed absent: cannot authenticate ownership, no valid jump to remove
+                    continue
 
         ip6tables_bin = resolve_trusted_binary("ip6tables")
         if ip6tables_bin:
@@ -3422,34 +3537,59 @@ class nulltrace:
                 ("mangle", "PREROUTING", CHAIN_V6_MANGLE_PREROUTING),
             ]
             for table, base, custom in jumps_v6:
-                res = run_trusted([ip6tables_bin, "-t", table, "-S", custom], check=False)
+                try:
+                    res = run_trusted([ip6tables_bin, "-t", table, "-S", custom], check=False)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Inspection error for IPv6 chain {custom} in table {table}: {exc}. "
+                        f"Refusing to modify jump in {base}."
+                    )
                 if isinstance(res.returncode, int) and res.returncode == 0:
                     lines = (res.stdout or "").splitlines()
                     if not is_chain_authenticated_nulltrace(lines, custom):
                         raise RuntimeError(
-                            f"Refusing to remove IPv6 jump from {base} to unauthenticated chain {custom} in table {table}"
+                            f"Refusing to remove IPv6 jump from {base} to unauthenticated chain {custom} in table {table} "
+                            "(ownership cannot be established)"
                         )
+                    for _ in range(5):
+                        res_del = run_trusted([ip6tables_bin, "-t", table, "-D", base, "-j", custom], check=False)
+                        if isinstance(res_del.returncode, int) and res_del.returncode != 0:
+                            combined_del = f"{res_del.stderr or ''} {res_del.stdout or ''}".lower()
+                            is_rule_absent = any(sub in combined_del for sub in (
+                                "bad rule", "does a matching rule exist", "no rule/chain/match", "does not exist", "not found"
+                            ))
+                            if not is_rule_absent and combined_del.strip():
+                                raise RuntimeError(
+                                    f"Failed to remove IPv6 jump from {base} to {custom} in table {table} (code {res_del.returncode}): "
+                                    f"{res_del.stderr or res_del.stdout}. Refusing unverified jump teardown."
+                                )
+                            break
                 elif isinstance(res.returncode, int) and res.returncode != 0:
-                    combined = (res.stderr or "").lower() + " " + (res.stdout or "").lower()
+                    combined = f"{res.stderr or ''} {res.stdout or ''}".lower()
                     is_absent = any(sub in combined for sub in POSITIVE_ABSENCE_SUBSTRINGS)
                     if not is_absent:
                         raise RuntimeError(
                             f"Inspection error for IPv6 chain {custom} in table {table} (code {res.returncode}): "
                             f"{res.stderr or res.stdout}. Refusing to modify jump in {base}."
                         )
-                for _ in range(5):
-                    res_del = run_trusted([ip6tables_bin, "-t", table, "-D", base, "-j", custom], check=False)
-                    if isinstance(res_del.returncode, int) and res_del.returncode != 0 and "does a matching rule exist" in (res_del.stderr or "").lower():
-                        break
+                    continue
 
     def _destroy_authenticated_chain(self, iptables_bin: str, table: str, chain: str) -> None:
         """
-        Authenticate chain ownership before flushing or deleting (NT-04, Section 7, Section 27).
+        Authenticate chain ownership before flushing or deleting (Section 6, Section 7, NT-04).
         If chain is absent: safe no-op.
         If chain is present and authenticated: flush (-F) and delete (-X).
         If chain is present but unauthenticated or inspection failed: refuse to flush/delete and raise RuntimeError.
         """
-        res = run_trusted([iptables_bin, "-t", table, "-S", chain], check=False)
+        try:
+            res = run_trusted([iptables_bin, "-t", table, "-S", chain], check=False)
+        except subprocess.CalledProcessError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"Firewall teardown inspection failed for chain '{chain}' in table '{table}': {exc}. "
+                "Refusing destructive teardown."
+            )
         if not isinstance(res.returncode, int):
             # Unit test mock without returncode configured: treat as authenticated owned chain
             rc = 0
@@ -3474,7 +3614,7 @@ class nulltrace:
             return
 
         # rc != 0: verify whether chain is actually absent via positive absence substrings only (Section 7)
-        combined = f"{err} {out}"
+        combined = f"{err} {out}".strip()
         is_absent = any(sub in combined for sub in POSITIVE_ABSENCE_SUBSTRINGS)
         if is_absent:
             # Chain is absent: safe no-op
@@ -3579,16 +3719,26 @@ class nulltrace:
         except Exception as exc:
             failures.append(f"Rollback firewall teardown failed: {exc}")
 
-        if self.mac_randomize:
+        if getattr(self, "_mac_randomized", False):
             try:
                 self._restore_mac()
             except Exception as exc:
                 failures.append(f"Rollback MAC restoration failed: {exc}")
 
-        try:
-            self.restore_tor_config()
-        except Exception as exc:
-            failures.append(f"Rollback Tor config restoration failed: {exc}")
+        tor_needs_restore = getattr(self, "_tor_config_applied", False)
+        if not tor_needs_restore:
+            try:
+                path = Path(self.config.tor_config)
+                if path.exists() and torrc_has_managed_block(path.read_text(encoding="utf-8")):
+                    tor_needs_restore = True
+            except Exception:
+                pass
+
+        if tor_needs_restore:
+            try:
+                self.restore_tor_config()
+            except Exception as exc:
+                failures.append(f"Rollback Tor config restoration failed: {exc}")
 
         if failures:
             self._restore_failures = failures
@@ -3668,18 +3818,51 @@ class nulltrace:
             self._session_id = uuid.uuid4().hex[:12]
             self._session_created_at = datetime.now().isoformat()
 
-            # P1-10 & NT-03: Capture all baseline components BEFORE state mutation or persistence
+            # Section 11, Section 12: Capture all baseline components BEFORE state mutation or persistence
             self._tor_initially_active = self.check_tor_service()
             self._tor_initially_enabled = self._check_tor_service_enabled()
             path = self.validate_tor_config_target(self.config.tor_config)
             self._tor_config_existed = path.exists()
 
+            # Baseline completeness validation: ABORT BEFORE ANY MUTATION (Critical Issue #11)
+            if self._tor_initially_active is None:
+                raise RuntimeError(
+                    "Cannot activate nulltrace: Tor initial active state is UNKNOWN. "
+                    "Refusing mutation to prevent unrecoverable service state."
+                )
+
+            if resolve_trusted_binary("systemctl") and self._tor_initially_enabled is None:
+                raise RuntimeError(
+                    "Cannot activate nulltrace: Tor initial enabled state is UNKNOWN. "
+                    "Refusing mutation to prevent unrecoverable service state."
+                )
+
+            if self._tor_config_existed is None:
+                raise RuntimeError(
+                    "Cannot activate nulltrace: Tor configuration existence state is UNKNOWN. "
+                    "Refusing mutation to prevent unrecoverable configuration state."
+                )
+
             if self.mac_randomize:
                 intf = self._get_primary_interface()
-                if intf:
-                    self._spoofed_intf = intf
-                    self._original_mac = self._read_current_mac(intf)
-                    self._interface_initially_up = self._is_interface_up(intf)
+                if not intf:
+                    raise RuntimeError(
+                        "Cannot activate nulltrace: Could not determine primary network interface for MAC spoofing. "
+                        "Aborting before mutation."
+                    )
+                self._spoofed_intf = intf
+                self._original_mac = self._read_current_mac(intf)
+                if not self._original_mac:
+                    raise RuntimeError(
+                        f"Cannot activate nulltrace: Could not read original hardware MAC for interface '{intf}'. "
+                        "Aborting before mutation to prevent permanent MAC loss."
+                    )
+                self._interface_initially_up = self._is_interface_up(intf)
+                if self._interface_initially_up is None:
+                    raise RuntimeError(
+                        f"Cannot activate nulltrace: Could not verify initial administrative state for interface '{intf}'. "
+                        "Aborting before mutation."
+                    )
 
             self._baseline_captured = True
             self._set_state(STATE_PREPARING)
@@ -3693,15 +3876,15 @@ class nulltrace:
             signal.signal(signal.SIGINT, _sig_handler)
             signal.signal(signal.SIGTERM, _sig_handler)
 
+            # PERSIST AUTHORITATIVE BASELINE BEFORE MUTATING HOST STATE (Section 11, Section 12)
             print("[*] Backing up network and Tor configuration...")
             self.backup_iptables()
-
-            if self.mac_randomize:
-                self._randomize_mac()
-
-            # Backup Tor config and persist durable recovery metadata BEFORE destructive changes (P0.3, Sec 6)
             self.backup_tor_config()
             self._persist_session_metadata()
+
+            # ONLY THEN MUTATE: MAC, Tor, firewall
+            if self.mac_randomize:
+                self._randomize_mac()
 
             print("[*] Applying Tor configuration...")
             self.apply_tor_config()
@@ -4039,13 +4222,15 @@ class nulltrace:
             except RuntimeError as exc:
                 print(f"    IP check: {exc}")
 
-    def _read_control_port(self) -> int:
+    def _read_control_port(self) -> Optional[int]:
         """
-        Discover effective Tor ControlPort from configuration (P2.3).
+        Discover effective Tor ControlPort from configuration (Section 8, Section 9, P2.3).
         Ignores comments, handles address:port syntax, and selects the last active valid directive.
+        ControlPort 0 explicitly disables the ControlPort and returns 0 (not 9051).
         """
         path = Path(self.config.tor_config)
-        effective_port = 9051
+        effective_port: Optional[int] = None
+        has_directive = False
         if path.exists():
             try:
                 for line in path.read_text(encoding="utf-8").splitlines():
@@ -4054,22 +4239,71 @@ class nulltrace:
                         continue
                     parts = clean_line.split()
                     if len(parts) >= 2 and parts[0].lower() == "controlport":
+                        has_directive = True
                         target = parts[1]
                         port_str = target.rsplit(":", 1)[-1] if ":" in target else target
                         try:
                             port = int(port_str)
-                            if self.is_valid_port(port):
+                            if port == 0:
+                                effective_port = 0
+                            elif self.is_valid_port(port):
                                 effective_port = port
                         except ValueError:
                             continue
             except OSError:
                 pass
-        return effective_port
+
+        if effective_port == 0:
+            return 0
+
+        if effective_port is not None:
+            return effective_port
+
+        if not has_directive:
+            return 9051
+
+        return None
+
+    @staticmethod
+    def _parse_tor_control_reply(raw_resp: bytes) -> bool:
+        """
+        Parse Tor control protocol reply according to spec (Section 8, Section 9).
+        Reply consists of lines: <status_code><sep><text>\r\n
+        sep is ' ' for final line, '-' for mid-reply line, '+' for data.
+        Returns True iff the final status code is 250 and no error code (4xx/5xx) is present.
+        """
+        if not raw_resp:
+            return False
+        lines = [l.strip() for l in raw_resp.split(b"\r\n") if l.strip()]
+        if not lines:
+            return False
+        for line in lines:
+            if len(line) >= 3 and line[:3].isdigit():
+                code = int(line[:3])
+                if code != 250:
+                    return False
+            else:
+                return False
+        final_line = lines[-1]
+        if final_line.startswith(b"250 ") or final_line == b"250":
+            return True
+        return False
 
     def _tor_control_newnym(self) -> bool:
         """
-        Request a new identity via Tor ControlPort SIGNAL NEWNYM after validating control cookie (Section 18).
+        Request a new identity via Tor ControlPort SIGNAL NEWNYM after validating control cookie (Section 8, Section 9, Section 18).
+        Validates ControlPort != 0, listener exists and is strictly owned by verified Tor instance
+        BEFORE reading or transmitting authentication cookie.
         """
+        port = self._read_control_port()
+        if not port or port == 0 or not self.is_valid_port(port):
+            return False
+
+        # 1. Verify expected bind address and genuine Tor listener ownership BEFORE touching cookie (Section 8, Section 9)
+        if not self._verify_listener_ownership(port, "tcp"):
+            return False
+
+        # 2. Authenticate cookie permissions and ownership
         cookie_path: Optional[Path] = None
         for p in CONTROL_COOKIE_PATHS:
             if not (p.exists() or os.path.islink(str(p))):
@@ -4101,20 +4335,17 @@ class nulltrace:
         if cookie_path is None:
             return False
 
-        port = self._read_control_port()
         try:
             cookie = cookie_path.read_bytes()
             with socket.create_connection(("127.0.0.1", port), timeout=8) as sock:
                 auth = f"AUTHENTICATE {cookie.hex()}\r\n".encode()
                 sock.sendall(auth)
-                resp = sock.recv(256)
-                lines = resp.split(b"\r\n")
-                if not any(l.startswith(b"250 ") or l == b"250" or l.startswith(b"250-") for l in lines):
+                resp = sock.recv(1024)
+                if not self._parse_tor_control_reply(resp):
                     return False
                 sock.sendall(b"SIGNAL NEWNYM\r\n")
-                response = sock.recv(256)
-                resp_lines = response.split(b"\r\n")
-                return any(l.startswith(b"250 ") or l == b"250" or l.startswith(b"250-") for l in resp_lines)
+                response = sock.recv(1024)
+                return self._parse_tor_control_reply(response)
         except OSError:
             return False
 
@@ -4124,13 +4355,18 @@ class nulltrace:
         Does not fall back to SIGHUP/reload, which cannot guarantee a new identity.
         """
         require_linux_root("signal Tor for new identity")
+        port = self._read_control_port()
+        if not port or port == 0:
+            raise RuntimeError(
+                "Unable to request new Tor identity: ControlPort is disabled (ControlPort 0) or unavailable."
+            )
         if self._tor_control_newnym():
             time.sleep(5)
             self.show_current_ip()
             return
 
         raise RuntimeError(
-            "Unable to request new Tor identity: ControlPort NEWNYM signal failed or "
+            "Unable to request new Tor identity: ControlPort NEWNYM signal failed, listener unverified, or "
             "ControlPort authentication cookie is unavailable."
         )
 

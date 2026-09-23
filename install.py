@@ -359,9 +359,11 @@ def uninstall_nulltrace(
                     if confirm != "DESTROY-FIREWALL":
                         print("[!] Emergency wipe rejected. Uninstallation aborted to protect firewall state.")
                         sys.exit(1)
+                        return
                 else:
                     print("[!] Uninstallation aborted. Run with --emergency-flush-all-rules to force wipe.")
                     sys.exit(1)
+                    return
 
             # Only executed if explicitly requested and confirmed (P2-8)
             print("[!] Executing emergency firewall table wipe as requested...")

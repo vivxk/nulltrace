@@ -853,7 +853,7 @@ class TestP0_RecoveryAndEnforcementTruth(unittest.TestCase):
             with patch("nulltrace.PERSISTENT_DIR", tmp_path), patch("nulltrace.RUN_DIR", tmp_path):
                 # State exists pointing to non-existent session directory
                 (tmp_path / "state.json").write_text(json.dumps({
-                    "session_id": "ghost_session",
+                    "session_id": "a1b2c3d4e5f60718",
                     "state": nulltrace.STATE_ACTIVE,
                 }), encoding="utf-8")
 
@@ -1940,13 +1940,21 @@ class TestSection11_ComprehensiveRegressions(unittest.TestCase):
         """P0-1: atomic_write rejects writing to symlinks."""
         with tempfile.TemporaryDirectory() as tmpdir:
             dest = Path(tmpdir) / "test.conf"
-            mock_lstat = MagicMock()
-            mock_lstat.st_mode = stat.S_IFLNK | 0o777
-            with patch("os.lstat", return_value=mock_lstat), \
-                 patch("pathlib.Path.exists", return_value=True):
-                with self.assertRaises(ValueError) as ctx:
-                    nulltrace.atomic_write(dest, "data")
-                self.assertIn("symlink", str(ctx.exception).lower())
+            try:
+                dest.symlink_to(Path(tmpdir) / "target")
+            except (OSError, NotImplementedError):
+                mock_lstat = MagicMock()
+                mock_lstat.st_mode = stat.S_IFLNK | 0o777
+                with patch("os.lstat", return_value=mock_lstat), \
+                     patch("os.path.islink", return_value=True):
+                    with self.assertRaises(ValueError) as ctx:
+                        nulltrace.atomic_write(dest, "data")
+                    self.assertIn("symlink", str(ctx.exception).lower())
+                return
+
+            with self.assertRaises(ValueError) as ctx:
+                nulltrace.atomic_write(dest, "data")
+            self.assertIn("symlink", str(ctx.exception).lower())
 
     def test_fs_insecure_parent_directory_atomic_write(self):
         """P0-1 & P2-2: atomic_write rejects world-writable parent directories."""
@@ -1957,6 +1965,7 @@ class TestSection11_ComprehensiveRegressions(unittest.TestCase):
             mock_st.st_uid = 0
             mock_st.st_gid = 0
             with patch("os.stat", return_value=mock_st), \
+                 patch("os.fstat", return_value=mock_st), \
                  patch.object(os, "_force_posix_security_checks", True, create=True), \
                  patch("os.geteuid", return_value=0, create=True):
                 with self.assertRaises(ValueError) as ctx:
@@ -2201,38 +2210,41 @@ class TestSection11_ComprehensiveRegressions(unittest.TestCase):
 
     def test_service_and_interface_state_restoration(self):
         """P1-10 & P1-11: Original Tor service state (active/enabled) and interface administrative state (up/down) restored."""
-        app = nulltrace.nulltrace()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            torrc = Path(tmpdir) / "torrc"
+            torrc.write_text("TransPort 9040\n", encoding="utf-8")
+            app = nulltrace.nulltrace()
 
-        # Tor initially inactive -> teardown calls "stop"
-        app._tor_initially_active = False
-        app._tor_initially_enabled = True
-        with patch.object(app, "validate_tor_config_target", return_value=Path("/etc/tor/torrc")), \
-             patch.object(app, "_control_tor_service", return_value=(True, "")) as mock_ctrl, \
-             patch.object(app, "_load_session_metadata", return_value={
-                 "tor_config_existed": False,
-                 "tor_service_initially_active": False,
-                 "tor_service_initially_enabled": True
-             }):
-            app.restore_tor_config()
-            mock_ctrl.assert_called_with("stop")
+            # Tor initially inactive -> teardown calls "stop"
+            app._tor_initially_active = False
+            app._tor_initially_enabled = True
+            with patch.object(app, "validate_tor_config_target", return_value=torrc), \
+                 patch.object(app, "_control_tor_service", return_value=(True, "")) as mock_ctrl, \
+                 patch.object(app, "_load_session_metadata", return_value={
+                     "tor_config_existed": False,
+                     "tor_service_initially_active": False,
+                     "tor_service_initially_enabled": True
+                 }):
+                app.restore_tor_config()
+                mock_ctrl.assert_called_with("stop")
 
-        # Tor initially disabled -> teardown calls "disable"
-        app._tor_initially_active = True
-        app._tor_initially_enabled = False
-        with patch.object(app, "validate_tor_config_target", return_value=Path("/etc/tor/torrc")), \
-             patch.object(app, "_control_tor_service", return_value=(True, "")) as mock_ctrl, \
-             patch.object(app, "_load_session_metadata", return_value={
-                 "tor_config_existed": False,
-                 "tor_service_initially_active": True,
-                 "tor_service_initially_enabled": False
-             }):
-            app.restore_tor_config()
-            mock_ctrl.assert_any_call("disable")
+            # Tor initially disabled -> teardown calls "disable"
+            app._tor_initially_active = True
+            app._tor_initially_enabled = False
+            with patch.object(app, "validate_tor_config_target", return_value=torrc), \
+                 patch.object(app, "_control_tor_service", return_value=(True, "")) as mock_ctrl, \
+                 patch.object(app, "_load_session_metadata", return_value={
+                     "tor_config_existed": False,
+                     "tor_service_initially_active": True,
+                     "tor_service_initially_enabled": False
+                 }):
+                app.restore_tor_config()
+                mock_ctrl.assert_any_call("disable")
 
-        # Interface initially DOWN -> restored as DOWN
-        app._spoofed_intf = "eth0"
-        app._original_mac = "00:11:22:33:44:55"
-        app._interface_initially_up = False
+            # Interface initially DOWN -> restored as DOWN
+            app._spoofed_intf = "eth0"
+            app._original_mac = "00:11:22:33:44:55"
+            app._interface_initially_up = False
         with patch("nulltrace.require_trusted_binary", return_value="/usr/sbin/ip"), \
              patch.object(app, "_read_current_mac", return_value="00:11:22:33:44:55"), \
              patch.object(app, "_persist_session_metadata"), \
@@ -2344,7 +2356,8 @@ class TestSection11_ComprehensiveRegressions(unittest.TestCase):
             dest = Path(tmpdir) / "test.conf"
 
             # 1. chmod failure is fatal
-            with patch("os.chmod", side_effect=PermissionError("chmod denied")):
+            with patch("os.fchmod", side_effect=PermissionError("chmod denied"), create=True), \
+                 patch("os.chmod", side_effect=PermissionError("chmod denied")):
                 with self.assertRaises(PermissionError):
                     nulltrace.atomic_write(dest, "data")
             self.assertEqual(len(list(Path(tmpdir).glob(".*tmp*"))), 0)

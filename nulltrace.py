@@ -316,6 +316,11 @@ def atomic_write(
     parent_path = dest_path.parent
     parent_path.mkdir(parents=True, exist_ok=True)
 
+    if os.path.islink(str(parent_path)):
+        raise ValueError(f"Parent '{parent_path}' is a symlink; refusing privileged write.")
+    if os.path.islink(str(dest_path)):
+        raise ValueError(f"Destination '{path}' is a symlink; refusing privileged write.")
+
     dir_flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         dir_flags |= os.O_DIRECTORY
@@ -333,8 +338,6 @@ def atomic_write(
         if dir_fd is not None:
             st_dir = os.fstat(dir_fd)
         else:
-            if os.path.islink(str(parent_path)):
-                raise ValueError(f"Parent '{parent_path}' is a symlink; refusing privileged write.")
             st_dir = os.stat(str(parent_path))
 
         if not stat.S_ISDIR(st_dir.st_mode):
@@ -437,6 +440,9 @@ def atomic_write(
                     )
 
             # Re-check destination in dir before replace to prevent race to symlink
+            if os.path.islink(str(dest_path)):
+                raise ValueError(f"Destination '{path}' was replaced with a symlink; refusing write.")
+
             if has_dir_fd_stat:
                 try:
                     pre_stat = os.stat(dest_name, dir_fd=dir_fd, follow_symlinks=False)

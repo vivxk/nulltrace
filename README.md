@@ -2,7 +2,7 @@
 
 **Advanced Privacy Tool with Hardened Transparent Tor Proxying**
 
-nulltrace routes system traffic through the Tor network on Linux using iptables transparent proxying. It enforces strict egress filtering, isolated connection tracking, transactional owned firewall chains, and fail-closed IPv6 protection.
+nulltrace routes system traffic through the Tor network on Linux using iptables transparent proxying. It enforces strict egress filtering, isolated connection tracking, staged/durable owned firewall chains with crash recovery, and fail-closed IPv6 protection.
 
 ![nulltrace](https://img.shields.io/badge/Privacy-Enhanced-brightgreen)
 ![Security](https://img.shields.io/badge/Security-Hardened-red)
@@ -38,6 +38,7 @@ nulltrace routes system traffic through the Tor network on Linux using iptables 
 - **Status Distinguishes Enforcement from Tor Routing**: Status queries distinguish `ENFORCING_TOR_HEALTHY` (firewall enforcing and Tor operational) from `ENFORCING_TOR_UNHEALTHY` (firewall enforcing, Tor down — traffic remains safely blocked, never leaking direct).
 - **Cross-Process Session Binding**: Every activation session receives a unique session ID (`session_<id>`). A fresh `--stop` or `--recover` process automatically discovers and binds to the active session directory and restores its exact backups. Inactive historical sessions are never recovered.
 - **Ownership-Aware Tor Configuration**: Baseline snapshot is taken once per session. On teardown, only the Nulltrace-managed block is stripped, preserving any concurrent administrator settings added outside the block.
+- **Pre-NullTrace Baseline Restoration Policy**: Teardown strictly restores the captured pre-NullTrace baseline (original Tor daemon active/enabled status, initial torrc existence, and original interface administrative UP/DOWN state). Host modifications made to these specific properties during an active session are restored to their captured pre-activation state upon teardown, returning the host safely to its initial environment.
 - **Explicit Lifecycle States**: Full state machine transitions through `INACTIVE` -> `PREPARING` -> `ACTIVE` -> `RESTORING` -> `INACTIVE`, `RESTORE_FAILED`, or `RECOVERY_REQUIRED`.
 - **Tri-State Teardown Verification**: Teardown verification distinguishes between clean removal (`VERIFIED_CLEAN`), remaining rules (`VERIFIED_DIRTY`), and inspection errors (`VERIFICATION_FAILED`). Recovery state is never deleted unless teardown is proven clean.
 - **Race-Resistant FD-Relative Atomic Writes & Symlink Containment**: All configuration, state, and backup files are written with 0600 mode using genuinely race-resistant FD-relative operations on Linux (`openat` with `O_DIRECTORY | O_NOFOLLOW`, metadata applied to open descriptors before `fsync`, `os.rename(..., src_dir_fd=..., dst_dir_fd=...)`, and directory fsync). Fails closed if safe semantics cannot be guaranteed. Path resolution strictly confines configuration to canonical `~/.config/nulltrace/`, rejecting symlinked directories, symlinked files, FIFOs, and devices.

@@ -3481,7 +3481,277 @@ class TestSection18_LinuxTestMatrix(unittest.TestCase):
         self.assertIn("unterminated", str(ctx.exception).lower())
 
 
+class TestLatestRemediations_NT01_Through_NT12(unittest.TestCase):
+    """
+    Direct regression tests for remediation issues NT-01 through NT-12
+    as specified in nulltrace_detailed_remediation_handoff_latest.md.
+    """
+
+    def setUp(self):
+        self.app = nulltrace.nulltrace()
+        self.app._tor_user = "109"
+
+    # NT-01: Tor enabled-state detection distinguishes UNKNOWN from DISABLED
+    @patch("nulltrace.resolve_trusted_binary", return_value="/usr/bin/systemctl")
+    def test_nt01_tor_service_enabled_tristate(self, mock_resolve):
+        """NT-01: _check_tor_service_enabled returns True, False, or None; never coerces error to False."""
+        # 1. systemctl is-enabled returns 0 and 'enabled' -> True
+        with patch("nulltrace.run_trusted") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="enabled\n", stderr="")
+            self.assertTrue(self.app._check_tor_service_enabled())
+
+        # 2. systemctl is-enabled returns 1 and 'disabled' -> False
+        with patch("nulltrace.run_trusted") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="disabled\n", stderr="")
+            self.assertFalse(self.app._check_tor_service_enabled())
+
+        # 3. systemctl is-enabled returns 1 and 'masked' -> False
+        with patch("nulltrace.run_trusted") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="masked\n", stderr="")
+            self.assertFalse(self.app._check_tor_service_enabled())
+
+        # 4. systemctl is-enabled returns 1 and bus error / unexpected error -> None
+        with patch("nulltrace.run_trusted") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="Failed to connect to bus: Host is down\n")
+            self.assertIsNone(self.app._check_tor_service_enabled())
+
+        # 5. systemctl not found -> None
+        with patch("nulltrace.resolve_trusted_binary", return_value=None):
+            self.assertIsNone(self.app._check_tor_service_enabled())
+
+    def test_nt01_teardown_does_not_disable_when_initially_enabled_is_unknown(self):
+        """NT-01: restore_tor_config does not disable Tor when tor_service_initially_enabled is None."""
+        with patch.object(self.app, "_load_session_metadata", return_value={
+            "tor_service_initially_active": True,
+            "tor_service_initially_enabled": None,
+            "tor_config_existed": True,
+        }), patch.object(self.app, "validate_tor_config_target") as mock_val, \
+           patch.object(self.app, "_control_tor_service", return_value=(True, "")) as mock_ctrl:
+            mock_val.return_value.exists.return_value = False
+            self.app.restore_tor_config()
+            # Must restart, but must NOT call disable
+            called_actions = [call.args[0] for call in mock_ctrl.call_args_list]
+            self.assertIn("restart", called_actions)
+            self.assertNotIn("disable", called_actions)
+
+    # NT-02: service tor status must not be treated as proof of active Tor
+    def test_nt02_service_tor_status_requires_verified_process(self):
+        """NT-02: _control_tor_service('is-active') requires verified Tor process, never trusts service exit code 0 alone."""
+        with patch("nulltrace.resolve_trusted_binary", side_effect=lambda name: f"/usr/bin/{name}"):
+            # 1. service exits 0, but no verified Tor process -> False
+            with patch("nulltrace.run_trusted") as mock_run, \
+                 patch.object(self.app, "_has_verified_tor_process", return_value=False):
+                mock_run.return_value = MagicMock(returncode=0, stdout="[ * ] tor is running\n", stderr="")
+                ok, detail = self.app._control_tor_service("is-active")
+                self.assertFalse(ok)
+                self.assertIn("no verified Tor daemon process was found", detail)
+
+            # 2. service exits 0, AND verified Tor process exists -> True
+            with patch("nulltrace.run_trusted") as mock_run, \
+                 patch.object(self.app, "_has_verified_tor_process", return_value=True):
+                mock_run.return_value = MagicMock(returncode=0, stdout="active\n", stderr="")
+                ok, detail = self.app._control_tor_service("is-active")
+                self.assertTrue(ok)
+
+            # 3. service command fails, no verified process -> False
+            with patch("nulltrace.run_trusted") as mock_run, \
+                 patch.object(self.app, "_has_verified_tor_process", return_value=False):
+                mock_run.return_value = MagicMock(returncode=3, stdout="inactive\n", stderr="")
+                ok, detail = self.app._control_tor_service("is-active")
+                self.assertFalse(ok)
+
+    # NT-03: Persist baseline only after baseline capture is complete
+    def test_nt03_baseline_capture_before_persistence(self):
+        """NT-03: Session metadata stores None for unobserved fields; baseline_captured marks observation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.app._session_id = "test_nt03_sess"
+            with patch.object(self.app, "_session_dir", return_value=Path(tmpdir)):
+                self.app._persist_session_metadata()
+                meta_file = Path(tmpdir) / "metadata.json"
+                self.assertTrue(meta_file.exists())
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                self.assertFalse(meta.get("baseline_captured"))
+                self.assertIsNone(meta.get("tor_service_initially_active"))
+                self.assertIsNone(meta.get("tor_service_initially_enabled"))
+                self.assertIsNone(meta.get("interface_initially_up"))
+                self.assertIsNone(meta.get("tor_config_existed"))
+
+    # NT-04: Firewall teardown authenticates chain ownership before destructive operations
+    def test_nt04_firewall_teardown_authenticates_chain_ownership(self):
+        """NT-04: _destroy_authenticated_chain refuses to flush/delete chains lacking the nulltrace marker."""
+        with patch("nulltrace.run_trusted") as mock_run:
+            # 1. Chain present and authenticated with marker -> flushes (-F) and deletes (-X)
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout=f"-N NULLTRACE_OUTPUT\n-A NULLTRACE_OUTPUT -m comment --comment {nulltrace.CHAIN_MARKER_COMMENT}\n",
+                stderr="",
+            )
+            self.app._destroy_authenticated_chain("/sbin/iptables", "filter", "NULLTRACE_OUTPUT")
+            cmds = [call.args[0] for call in mock_run.call_args_list]
+            self.assertIn(["/sbin/iptables", "-t", "filter", "-F", "NULLTRACE_OUTPUT"], cmds)
+            self.assertIn(["/sbin/iptables", "-t", "filter", "-X", "NULLTRACE_OUTPUT"], cmds)
+
+        with patch("nulltrace.run_trusted") as mock_run:
+            # 2. Chain present but unauthenticated (missing marker) -> raises RuntimeError
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="-N NULLTRACE_OUTPUT\n-A NULLTRACE_OUTPUT -j ACCEPT\n",
+                stderr="",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                self.app._destroy_authenticated_chain("/sbin/iptables", "filter", "NULLTRACE_OUTPUT")
+            self.assertIn("ownership authentication failed", str(ctx.exception))
+
+        with patch("nulltrace.run_trusted") as mock_run:
+            # 3. Chain absent -> safe no-op
+            mock_run.return_value = MagicMock(
+                returncode=1,
+                stdout="",
+                stderr="iptables: No chain/target/match by that name.\n",
+            )
+            self.app._destroy_authenticated_chain("/sbin/iptables", "filter", "NULLTRACE_OUTPUT")
+            # Should NOT attempt -F or -X
+            cmds = [call.args[0] for call in mock_run.call_args_list]
+            self.assertEqual(len(cmds), 1)
+
+        with patch("nulltrace.run_trusted") as mock_run:
+            # 4. Inspection failure (e.g. backend error / permission denied) -> raises RuntimeError
+            mock_run.return_value = MagicMock(
+                returncode=2,
+                stdout="",
+                stderr="iptables: Permission denied (you must be root)\n",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                self.app._destroy_authenticated_chain("/sbin/iptables", "filter", "NULLTRACE_OUTPUT")
+            self.assertIn("inspection failed", str(ctx.exception))
+
+    # NT-05: _authenticate_or_create_chain distinguishes absence from inspection failure
+    def test_nt05_authenticate_or_create_chain_inspection_error(self):
+        """NT-05: _authenticate_or_create_chain aborts on inspection errors instead of treating them as absent."""
+        with patch("nulltrace.run_trusted") as mock_run:
+            # Generic error code 2 with lock error -> must raise RuntimeError
+            mock_run.return_value = MagicMock(
+                returncode=2,
+                stdout="",
+                stderr="Another app is currently holding the xtables lock.\n",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                self.app._authenticate_or_create_chain("/sbin/iptables", "filter", "NULLTRACE_OUTPUT")
+            self.assertIn("Firewall inspection error", str(ctx.exception))
+
+    # NT-06: Reject group-writable existing Tor configuration
+    def test_nt06_group_writable_tor_config_rejected(self):
+        """NT-06: validate_tor_config_target rejects group-writable configuration files (mode & 0o022)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            torrc = Path(tmpdir) / "torrc"
+            torrc.write_text("SOCKSPort 9050\n", encoding="utf-8")
+
+            # Group-writable file (0o664)
+            fake_stat = MagicMock(st_mode=stat.S_IFREG | 0o664, st_uid=0)
+            with patch.object(self.app, "is_valid_tor_config_path", return_value=True), \
+                 patch("pathlib.Path.stat", return_value=fake_stat), \
+                 patch("os.lstat", return_value=fake_stat), \
+                 patch("os.getuid", return_value=0, create=True):
+                with self.assertRaises(ValueError) as ctx:
+                    self.app.validate_tor_config_target(str(torrc))
+                self.assertIn("group-writable", str(ctx.exception))
+
+    # NT-07: Check result of service disable during restoration
+    def test_nt07_tor_disable_result_checked_during_restore(self):
+        """NT-07: restore_tor_config raises RuntimeError if service disable fails."""
+        with patch.object(self.app, "_load_session_metadata", return_value={
+            "tor_service_initially_active": False,
+            "tor_service_initially_enabled": False,
+            "tor_config_existed": True,
+        }), patch.object(self.app, "validate_tor_config_target") as mock_val, \
+           patch.object(self.app, "_control_tor_service") as mock_ctrl:
+            mock_val.return_value.exists.return_value = False
+            # Stop succeeds, but disable fails
+            mock_ctrl.side_effect = [(True, "stopped"), (False, "systemctl disable tor failed")]
+            with self.assertRaises(RuntimeError) as ctx:
+                self.app.restore_tor_config()
+            self.assertIn("disable failed", str(ctx.exception))
+            self.assertFalse(self.app._tor_service_restored)
+
+    # NT-08: Reject '.' and '..' in generic secure path traversal
+    def test_nt08_secure_open_dir_hierarchy_rejects_traversal(self):
+        """NT-08: secure_open_dir_hierarchy rejects '.' and '..' components in nulltrace.py and install.py."""
+        with self.assertRaises(ValueError) as ctx1:
+            nulltrace.secure_open_dir_hierarchy("/etc/tor/../etc")
+        self.assertIn("relative traversal element", str(ctx1.exception))
+
+        with self.assertRaises(ValueError) as ctx2:
+            nulltrace.secure_open_dir_hierarchy("/etc/tor/./torrc")
+        self.assertIn("relative traversal element", str(ctx2.exception))
+
+        with self.assertRaises(ValueError) as ctx3:
+            install.secure_open_dir_hierarchy("/usr/share/../bin")
+        self.assertIn("relative traversal element", str(ctx3.exception))
+
+        with self.assertRaises(ValueError) as ctx4:
+            install.secure_open_dir_hierarchy("/usr/share/./nulltrace")
+        self.assertIn("relative traversal element", str(ctx4.exception))
+
+    # NT-09: Interface-state detection supports UNKNOWN and fails closed
+    def test_nt09_interface_state_unknown_handling(self):
+        """NT-09: _is_interface_up returns None on unknown state; MAC randomization refuses to proceed."""
+        with patch("pathlib.Path.exists", return_value=False), \
+             patch("nulltrace.resolve_trusted_binary", return_value=None):
+            # When neither sysfs nor ip utility is available
+            self.assertIsNone(self.app._is_interface_up("eth0"))
+
+        with patch.object(self.app, "_get_primary_interface", return_value="eth0"), \
+             patch.object(self.app, "_read_current_mac", return_value="00:11:22:33:44:55"), \
+             patch.object(self.app, "_is_interface_up", return_value=None), \
+             patch("nulltrace.resolve_trusted_binary", return_value="/usr/bin/macchanger"):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.app._randomize_mac()
+            self.assertIn("Could not determine whether interface 'eth0' is administratively UP or DOWN", str(ctx.exception))
+
+    # NT-10: Baseline restoration policy preserved
+    def test_nt10_restoration_baseline_policy(self):
+        """NT-10: Tor config changes outside managed block survive teardown; baseline snapshot restores clean host."""
+        admin_content = "ControlPort 9051\nDataDirectory /var/lib/tor\n"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            torrc = Path(tmpdir) / "torrc"
+            # Simulate admin edited torrc during active session
+            torrc.write_text(
+                f"ControlPort 9051\n{nulltrace.TOR_CONFIG_BEGIN}\nTransPort 9040\n{nulltrace.TOR_CONFIG_END}\nDataDirectory /var/lib/tor\n",
+                encoding="utf-8"
+            )
+            self.app.config.tor_config = str(torrc)
+            with patch.object(self.app, "validate_tor_config_target", return_value=torrc), \
+                 patch.object(self.app, "_load_session_metadata", return_value={"tor_config_existed": True}), \
+                 patch.object(self.app, "_control_tor_service", return_value=(True, "")):
+                self.app.restore_tor_config()
+                self.assertEqual(torrc.read_text(encoding="utf-8"), admin_content)
+
+    # NT-11: Distinguish ENOENT from other destination-stat errors in install.py
+    def test_nt11_secure_deploy_file_distinguishes_enoent(self):
+        """NT-11: secure_deploy_file permits ENOENT (new file) but re-raises other OSErrors (EACCES, EIO)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest = Path(tmpdir) / "test_bin"
+            # EACCES error during stat must raise PermissionError / OSError
+            err_stat = OSError(errno.EACCES, "Permission denied")
+            with patch("install.secure_open_dir_hierarchy", return_value=123), \
+                 patch("os.fstat", return_value=MagicMock(st_mode=stat.S_IFDIR, st_uid=0)), \
+                 patch("os.stat", side_effect=err_stat):
+                with self.assertRaises(OSError) as ctx:
+                    install.secure_deploy_file("echo hi\n", dest)
+                self.assertEqual(ctx.exception.errno, errno.EACCES)
+
+    # NT-12: README terminology accurately reflects staged/durable firewall architecture
+    def test_nt12_readme_terminology_accuracy(self):
+        """NT-12: README.md must not make false transactionality claims; verifies staged/durable wording."""
+        readme_path = REPO_ROOT / "README.md"
+        self.assertTrue(readme_path.exists())
+        readme_text = readme_path.read_text(encoding="utf-8")
+        self.assertNotIn("transactional owned firewall chains", readme_text)
+        self.assertIn("staged/durable", readme_text)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 

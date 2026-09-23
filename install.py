@@ -191,6 +191,13 @@ def secure_open_dir_hierarchy(
     - Returns an open file descriptor bound to the target directory on Linux, or None on Windows.
     - If any component is a symlink or insecure, raises ValueError and closes open descriptors.
     """
+    raw_str = str(dir_path)
+    raw_components = [c for c in raw_str.replace("\\", "/").split("/") if c]
+    if any(comp in (".", "..") for comp in raw_components):
+        raise ValueError(
+            f"Security violation: path component in '{dir_path}' contains relative traversal element ('.' or '..'); refusing install."
+        )
+
     p = Path(dir_path)
     if not p.is_absolute():
         p = Path.cwd() / p
@@ -211,6 +218,10 @@ def secure_open_dir_hierarchy(
         # Cross-platform / Windows test runner fallback
         curr = Path(parts[0])
         for comp in parts[1:]:
+            if comp in (".", ".."):
+                raise ValueError(
+                    f"Security violation: path component '{comp}' in '{dir_path}' contains relative traversal element; refusing install."
+                )
             curr = curr / comp
             if curr.exists() or os.path.islink(str(curr)):
                 st = os.lstat(str(curr))
@@ -230,6 +241,10 @@ def secure_open_dir_hierarchy(
     curr_fd = os.open("/", dir_flags)
     try:
         for comp in parts[1:]:
+            if comp in (".", ".."):
+                raise ValueError(
+                    f"Security violation: path component '{comp}' in '{dir_path}' contains relative traversal element; refusing install."
+                )
             comp_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
             try:
                 next_fd = os.open(comp, comp_flags, dir_fd=curr_fd)
@@ -356,8 +371,9 @@ def secure_deploy_file(
             pre_st = os.stat(dest_name, dir_fd=dir_fd, follow_symlinks=False)
             if stat.S_ISLNK(pre_st.st_mode):
                 raise ValueError(f"Destination '{dest_path}' was replaced with a symlink; refusing install.")
-        except (FileNotFoundError, OSError):
-            pass
+        except (FileNotFoundError, OSError) as exc:
+            if getattr(exc, "errno", None) != errno.ENOENT and not isinstance(exc, FileNotFoundError):
+                raise
 
         if os.rename in getattr(os, "supports_dir_fd", set()):
             os.rename(tmp_name, dest_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)

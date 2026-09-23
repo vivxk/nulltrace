@@ -477,3 +477,103 @@ This section details the final security overhaul addressing every ticket in `nul
   4. Installer (6 tests): destination symlink rejected, insecure `/usr/share/nulltrace` rejected, insecure `/usr/bin` destination rejected, atomic replacement, temp launcher symlink safety, refusal to execute untrusted local checkout.
   5. Service & Interface Restoration (11 tests): initially active/inactive Tor preserved, initially enabled/disabled Tor preserved, unknown enabled state preserved, interface UP/DOWN restored, original torrc presence/absence restored, admin config preserved, unterminated managed block rejected safely.
 - **Total Test Suite**: 183 tests, 100% passing both in WSL Kali Linux (5.30s) and on Windows (1.86s).
+
+---
+
+## Detailed Remediation & Linux Integration Hardening (Tickets NT-01 through NT-14)
+
+This section details the remediation of issues NT-01 through NT-14 as specified in `nulltrace_detailed_remediation_handoff_latest.md`.
+
+### NT-01 (P1): Tor Enabled-State Tristate Detection (`_check_tor_service_enabled`)
+- **Issue**: Command failures or systemd bus inspection errors in `_check_tor_service_enabled()` could default or coerce to `False` (disabled), causing teardown to mistakenly disable Tor on systems where the service was originally running or unmanaged.
+- **Remediation**:
+  - Implemented tristate return model: `True` (definitely enabled), `False` (definitely disabled/masked), or `None` (unknown).
+  - Explicitly mapped `systemctl is-enabled` output states (`enabled` -> `True`; `disabled`, `masked`, `masked-runtime`, `static`, `indirect` -> `False`).
+  - Command failures, bus unavailability, and missing utilities preserve `None` (unknown).
+  - During teardown in `restore_tor_config()`, `disable` is only called if `tor_service_initially_enabled is False`.
+
+### NT-02 (P1): Verified Tor Process Identity for Service Status (`_control_tor_service`)
+- **Issue**: Fallback `service tor status` returning exit code 0 was trusted as proof of active Tor without validating whether the actual daemon process was running.
+- **Remediation**:
+  - `_control_tor_service("is-active")` now requires `_has_verified_tor_process()` across all backends.
+  - Verifies candidate Tor processes by inspecting UID and matching `/proc/<pid>/exe` against trusted binaries.
+  - A zero exit status from a service command alone is never treated as identity assertion if no verified Tor process exists.
+
+### NT-03 (P1): Baseline Capture Prior to Persistence (`setup_network_rules`)
+- **Issue**: State transition to `STATE_PREPARING` and session persistence occurred before observing the initial Tor service state, interface state, and configuration presence, potentially persisting default values before real baseline observation.
+- **Remediation**:
+  - Sequenced baseline observation to capture Tor active state, Tor enabled state, `torrc` existence, and primary interface administrative UP/DOWN state before calling `_set_state(STATE_PREPARING)`.
+  - Added `_baseline_captured = True` marker.
+  - Ensured `_persist_session_metadata()` stores `None` rather than fabricated `True`/`False` defaults for unobserved fields.
+
+### NT-04 (P1): Chain Ownership Authentication in Teardown (`_destroy_authenticated_chain`)
+- **Issue**: Teardown flushed (`-F`) and deleted (`-X`) chains by predictable name (`NULLTRACE_*`) without first verifying ownership, risking destruction of same-named chains created by administrators or other tools.
+- **Remediation**:
+  - Added `_destroy_authenticated_chain()`: inspects chain via `iptables -t <table> -S <chain>`.
+  - Positively validates presence of the exact ownership marker comment (`nulltrace-owned`) before calling `-F` or `-X`.
+  - Unauthenticated same-name chains abort fail-closed with `RuntimeError`.
+  - Positively absent chains result in a safe no-op.
+  - Command/inspection errors abort fail-closed with `RuntimeError` rather than proceeding.
+
+### NT-05 (P1): Positive Chain Absence vs. Inspection Error (`_authenticate_or_create_chain`)
+- **Issue**: Any non-zero exit code from `iptables -S` was treated as chain absence, which could mask backend locks, permission errors, or broken environments by attempting to recreate existing chains.
+- **Remediation**:
+  - Parsed non-zero status output for positive absence messages (`"no chain/target/match by that name"`, `"does not exist"`).
+  - Treated other errors (e.g. permission denied, lock contention, backend failures) as `INSPECTION_ERROR` and aborted with `RuntimeError`.
+
+### NT-06 (P1): Group-Writable Tor Config Target Rejection (`validate_tor_config_target`)
+- **Issue**: `validate_tor_config_target()` checked world-writable permissions (`0o002`) on existing configuration files but permitted group-writable files (`0o020`), which could allow accounts in Tor admin groups to alter privileged configuration.
+- **Remediation**:
+  - Enforced `mode & 0o022 == 0` check on both the target file and parent directory.
+  - Explicitly rejects group-writable and world-writable modes with descriptive `ValueError` messages.
+
+### NT-07 (P1/P2): Tor Service Disable Result Verification (`restore_tor_config`)
+- **Issue**: `restore_tor_config()` invoked `self._control_tor_service("disable")` without checking the return value, marking `_tor_service_restored = True` even if disabling failed.
+- **Remediation**:
+  - Captured `ok_dis, detail_dis = self._control_tor_service("disable")`.
+  - On failure, sets `_tor_service_restored = False` and raises `RuntimeError`, transitioning state to `RESTORE_FAILED`.
+
+### NT-08 (P2): Path Traversal `.` and `..` Rejection in Secure Directory Helper
+- **Issue**: `secure_open_dir_hierarchy()` accepted `.` and `..` path components if normalized away by `pathlib.Path`.
+- **Remediation**:
+  - Added unnormalized path component inspection in both `nulltrace.py` and `install.py`.
+  - Rejects any path containing `.` or `..` components with `ValueError` before performing privileged directory operations.
+
+### NT-09 (P2): Interface State Detection Supports UNKNOWN (`_is_interface_up`)
+- **Issue**: `_is_interface_up()` defaulted to `True` (UP) if neither sysfs nor ip utility provided state, failing open.
+- **Remediation**:
+  - Updated `_is_interface_up()` to return `Optional[bool]` (`True` for UP, `False` for DOWN, `None` for UNKNOWN).
+  - MAC randomization in `_randomize_mac()` aborts with `RuntimeError` if initial state is `None`.
+  - MAC restoration in `_restore_mac()` preserves initial state without guessing.
+
+### NT-10 (P2): Explicit Pre-NullTrace Baseline Restoration Policy
+- **Issue**: Baseline restoration could overwrite deliberate administrator changes made during an active session without explicit warning or documentation.
+- **Remediation**:
+  - Documented the pre-NullTrace baseline restoration policy in `README.md`.
+  - Retained administrator additions outside the managed `# BEGIN NULLTRACE CONFIG` block in `torrc`.
+  - Preserved unrelated administrator rules in base firewall tables during teardown.
+  - Emitted informative baseline restoration logs during teardown.
+
+### NT-11 (P2): Distinguish ENOENT in Installer Deployment (`install.py`)
+- **Issue**: `secure_deploy_file()` caught generic `OSError` during destination stat, treating all errors alike.
+- **Remediation**:
+  - Checked `exc.errno == errno.ENOENT` and `FileNotFoundError`.
+  - Re-raises non-ENOENT `OSError` exceptions (such as `EACCES`, `EIO`, `ESTALE`) as fatal errors.
+
+### NT-12 (P2): Accurate Architecture Terminology in Documentation (`README.md`)
+- **Issue**: `README.md` previously described the system using "transactional owned firewall chains", implying a single atomic kernel transaction.
+- **Remediation**:
+  - Updated all references to "staged/durable owned firewall chains with crash recovery", accurately describing the multi-operation staged verification model.
+
+### NT-13 (P2): Comprehensive Regression Test Class (`TestLatestRemediations_NT01_Through_NT12`)
+- **Remediation**:
+  - Added 13 dedicated, behavior-focused regression test cases in `tests/test_remediation.py` verifying each issue NT-01 through NT-12.
+  - Replaced implementation-detail mock assumptions with cross-platform and mock-resilient inspection logic.
+  - Expanded total test suite to 196 tests with 100% pass rate.
+
+### NT-14 (P1/P2): Real Linux Integration Validation (WSL Kali Linux)
+- **Remediation**:
+  - Validated native execution on Kali Linux Rolling (Kernel 6.18.33.2-microsoft-standard-WSL2, Python 3.13.15, iptables v1.8.13 nf_tables, systemd 261, Tor 0.4.9.12).
+  - Introspected POSIX directory descriptor capabilities (`rename dir_fd`, `open dir_fd`, `stat dir_fd`, `unlink dir_fd`, `chown follow_symlinks`).
+  - Executed full 196-test suite natively in WSL Kali Linux (5.51s, 0 failures, 0 errors).
+  - Executed full 196-test suite on Windows test runner (1.34s, 0 failures, 0 errors).
